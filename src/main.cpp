@@ -1,0 +1,134 @@
+#include <Arduino.h>
+#include <RadioLib.h>
+#include <SPI.h>
+#include <esp_task_wdt.h>
+#include <Adafruit_NeoPixel.h>
+
+#include "signal.h"
+
+// --- Pin Definitions ---
+#define CC1101_MOSI 0
+#define CC1101_CS   1
+#define CC1101_GDO0 3
+#define CC1101_SCK  4
+#define CC1101_MISO 5
+
+#define BUTTON_PIN 9 // BOOT button
+#define LED_PIN 7    // LOLIN C3 Mini RGB LED
+#define NUMPIXELS 1
+
+SPIClass customSPI(FSPI);
+CC1101 radio = new Module(CC1101_CS, CC1101_GDO0, RADIOLIB_NC, RADIOLIB_NC, customSPI);
+Adafruit_NeoPixel strip(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// --- Dogtrace Signal ---
+const int32_t beep_signal[] = SIGNAL_BEEP;
+const size_t payloadSize = sizeof(beep_signal) / sizeof(beep_signal[0]);
+
+// --- Interrupt Variables ---
+volatile bool buttonTriggered = false;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 200;
+
+// --- Interrupt Service Routine ---
+void IRAM_ATTR handleButton() {
+    unsigned long currentTime = millis();
+    if (currentTime - lastDebounceTime > debounceDelay) {
+        buttonTriggered = true;
+        lastDebounceTime = currentTime;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000); // Give serial monitor time to connect
+
+    // 1. Initialize RGB LED
+    strip.begin();
+    strip.setBrightness(50);
+    strip.clear();
+    strip.show();
+
+    // 2. Configure Button and attach Interrupt
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButton, FALLING);
+
+    // 3. Radio Initialization
+    customSPI.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+
+    int state = radio.begin();
+    if (state == RADIOLIB_ERR_NONE) {
+        Serial.println(F("Radio Success!"));
+        // Flash Green to indicate radio is ready
+        strip.setPixelColor(0, strip.Color(0, 255, 0));
+        strip.show();
+
+        delay(500);
+
+        strip.clear();
+        strip.show();
+    } else {
+        Serial.print(F("Failed, code "));
+        Serial.println(state);
+        // Flash Red if radio fails to initialize
+        strip.setPixelColor(0, strip.Color(255, 0, 0));
+        strip.show();
+
+        while (true);
+    }
+
+    // 4. Configure CC1101 settings for Dogtrace
+    radio.setFrequency(869.525);
+    radio.setFrequencyDeviation(47.6);
+    radio.setOutputPower(10);
+    radio.setBitRate(100.0);
+    radio.setRxBandwidth(116.0);
+
+    pinMode(CC1101_GDO0, OUTPUT);
+    Serial.println(F("System Ready. Press BOOT button to transmit."));
+}
+
+void transmitSequence() {
+    // Suspend all FreeRTOS background tasks for absolute timing precision
+    // If the total transmission time exceeds the watchdog timeout, consider feeding the watchdog here or increasing its timeout duration.
+    vTaskSuspendAll();
+
+    for (int r = 0; r < 50; r++) {
+        for (size_t i = 0; i < payloadSize; i++) {
+            int32_t duration = beep_signal[i];
+
+            digitalWrite(CC1101_GDO0, (duration > 0) ? HIGH : LOW);
+
+            uint32_t start = micros();
+            uint32_t target = abs(duration);
+            while (micros() - start < target);
+        }
+
+        digitalWrite(CC1101_GDO0, LOW);
+        delayMicroseconds(5000); // 5ms gap
+    }
+
+    // Resume normal system operations
+    xTaskResumeAll();
+}
+
+void loop() {
+    if (buttonTriggered) {
+        Serial.println(F("Button pressed! Transmitting..."));
+
+        // Turn RGB LED BLUE while transmitting
+        strip.setPixelColor(0, strip.Color(0, 0, 255));
+        strip.show();
+
+        radio.transmitDirect(); // Enter transparent mode
+        transmitSequence();     // Fire the sequence
+        radio.standby();        // Back to sleep
+
+        // Turn RGB LED OFF after finishing
+        strip.clear();
+        strip.show();
+
+        buttonTriggered = false; // Reset the flag
+        Serial.println(F("Done. Waiting for next press."));
+    }
+}

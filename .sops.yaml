@@ -1,0 +1,3 @@
+creation_rules:
+  - path_regex: include/signal.h
+    age: 'age1k0c647skc7ws8hp6mnkktdmxvekftwynm2p4xt4hkrg66xxxg96qqpthnp'
