@@ -3,10 +3,10 @@
 This project replicates the control signal for a Dogtrace d-control 400 electric dog collar using a Wemos LOLIN C3 Mini (ESP32-C3) and a CC1101 transceiver module.
 
 ⚠️ IMPORTANT PROJECT SCOPE & DISCLAIMERS:
-* Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the precise RF parameters or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
-* Raw Replay: The signal in this code is a raw, fixed-code payload captured using an SDR (Software Defined Radio), cleaned up, fine-tuned and repeated. The RF parameters and signal timings used here are fine-tuned to work, but may not be the exact parameters used by the original remote.
-* Device Specific: The signal included in this code is specific to the remote used for the SDR capture. It is not a universal signal for all Dogtrace d-control 400 remotes, as each remote likely has a unique identifier embedded in the signal to prevent cross-interference between devices. Therefore this code cannot be used out of the box for any other remote. If other remote is to be used, it must be first captured by the SDR and replaced in the code.
-* Beep Only: This repository currently only contains the captured signal for the sound beep function. It could easily be extended to include the shock function by capturing that specific button press, but that is not a scope of this project at the moment.
+* Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the precise RF parameters, or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
+* Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR (Software Defined Radio), cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote.
+* Device Specific & Template Only: The original signal used to develop this project was specific to my personal remote. It is not a universal signal for all Dogtrace d-control 400 remotes, as each remote likely has a unique identifier embedded in the signal to prevent cross-interference. **For security reasons, my personal signal is encrypted in this repository.** Instead, this code provides a structural template. You must capture your own remote's signal using an SDR and inject it into the code.
+* Beep Only: This repository is currently structured around the sound beep function. It could easily be extended to include the shock function by capturing that specific button press, but that is not the scope of this project at the moment.
 
 ---
 
@@ -70,11 +70,35 @@ The ESP32 is a dual-core chip running a real-time OS (FreeRTOS) that handles bac
 
 ---
 
+## 🔑 Adding Custom Signal (Payload Configuration)
+
+For security and safety reasons, the actual payload timings for my personal dog collar are stored encrypted.
+
+To use this project, the RF signal for the specifc remote to be cloned has to be captured using an SDR (Software Defined Radio) and the captured microsecond timings have to be injected into the code.
+
+1. Locate the file include/signal.h in the repository.
+2. Copy-paste the macro below into the file, overwriting its current contents.
+3. Replace the dummy signal data inside with the captured timings (positive numbers for HIGH pulses, negative numbers for LOW gaps)
+
+```cpp
+#pragma once
+
+// Replace the numbers below with your SDR captured timings in microseconds.
+#define SIGNAL_BEEP { \
+  200, -200, 400, -400, 200, -200, ... \
+}
+```
+
+---
+
 ## 🛠️ Software Setup
 
 This project is built using PlatformIO. The RadioLib library is used for CC1101 control, and Adafruit NeoPixel is used for the onboard RGB LED status indicator.
 
-To upload the code run `pio run --target upload`.
+1. Ensure the signal header file is updated with the captured signal timings as described in the previous section.
+2. Change the `upload_port` and `monitor_port` in the `platformio.ini` file to match the tty port assigned to the Wemos LOLIN C3 Mini when connected via USB.
+3. Connect the Wemos LOLIN C3 Mini via USB.
+4. Build and upload the code using `pio run --target upload` (`pio run --target upload --targer monitor` if serial monitor is also desired).
 
 ---
 
