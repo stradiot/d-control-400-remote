@@ -14,9 +14,11 @@ This project replicates the control signal for a Dogtrace d-control 400 electric
 
 Demonstration of the project triggering the collar's sound beep function.
 
-<video src="doc/beep_demo.mp4" controls="controls" style="max-width: 100%; border-radius: 10px;">
-  Your browser does not support the video tag.
-</video>
+<div align="center">
+  <video src="https://raw.githubusercontent.com/stradiot/d-control-400-remote/main/doc/beep_demo.mp4" width="100%" controls>
+    <p>Your browser does not support the video tag. <a href="doc/beep_demo.mp4">Download the video instead</a>.</p>
+  </video>
+</div>
 
 > **Note:** Ensure your volume is up to hear the collar's confirmation beep!
 
