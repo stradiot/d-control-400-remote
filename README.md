@@ -10,6 +10,18 @@ This project replicates the control signal for a Dogtrace d-control 400 electric
 
 ---
 
+## 📺 Demo
+
+Demonstration of the project triggering the collar's sound beep function.
+
+<video src="doc/beep_demo.mp4" controls="controls" style="max-width: 100%; border-radius: 10px;">
+  Your browser does not support the video tag.
+</video>
+
+> **Note:** Ensure your volume is up to hear the collar's confirmation beep!
+
+---
+
 ## Hardware Requirements
 * Microcontroller: Wemos LOLIN C3 Mini (ESP32-C3).
 * Radio: CC1101 Transceiver Module (Must be the 868 MHz version, 26 MHz crystal).
@@ -54,6 +66,24 @@ graph LR
 
 ---
 
+## 📡 CC1101 RF Configuration Summary
+
+These RF parameters were fine-tuned through iterative testing to reliably trigger the collar. They may not be the exact parameters used by the original remote, but they work effectively for raw pulse transmission. Only the carrier frequency is based on the datasheet, the rest were derived empirically and through SDR analysis.
+
+| Parameter | Value | Why it matters |
+| :--- | :--- | :--- |
+| Carrier Frequency | 869.525 MHz | The exact frequency the Dogtrace collar is listening to. Given by datasheet. |
+| Modulation | 2-FSK | Maybe also GFSK, but 2-FSK works. |
+| Frequency Deviation | 47.6 kHz | Worked best, but may be adjusted. |
+| Bit Rate | 100.0 kbps | 20x oversampling of the 5kbps signal to eliminate jitter. |
+| Rx Bandwidth | 116.0 kHz | Derived from the deviation, based on the Carson’s Rule and set to the closest hardware filter step for a 26MHz crystal with some extra space. |
+| Sync Word | Disabled | Bit-banging raw pulses; no hardware packet handling. |
+| Preamble/CRC | Disabled | Bypasses the CC1101 packet engine for "Asynchronous Mode." |
+| Transmission Mode| Asynchronous | Maps the physical state of GDO0 directly to the RF output. |
+| Pulse Timings | ~200/400 µs | Empirical: Guessed from SDR capture and verified by trial. |
+
+---
+
 ## 🚀 Technical Specifics
 
 ### 1. 20x Bitrate Oversampling
@@ -61,12 +91,18 @@ The actual data rate of the 200 µs pulses is 5.0 kBaud. However, the CC1101's i
 * In Asynchronous mode, the CC1101 samples the GDO0 pin based on its internal clock. At 5 kbps, it only samples every 200 µs, causing massive timing jitter. Oversampling at 100 kbps forces the chip to sample the pin every 10 µs, eliminating jitter and forcing the frequency synthesizer to slew between frequencies instantly, creating crisp square waves.
 
 ### 2. Bandwidth Tuning
-Receiver bandwidth (RxBandwidth) is set to 116.0 kHz even though the project only implements a transmitter. This ensures the internal clock tree and frequency synthesizer have enough "room" to instantly shift the 47.6 kHz deviation without clipping or rounding the signal edges.
+Receiver bandwidth (RxBandwidth) is set to 116.0 kHz even though the project only implements a transmitter. This ensures the internal clock tree and frequency synthesizer have enough "room" to instantly shift the 47.6 kHz deviation without clipping or rounding the signal edges. The value of 116.0 kHz is the closest available hardware filter tap provided by the CC1101's internal clock dividers (based on a 26 MHz crystal) that safely encompasses our signal's occupied bandwidth.
 
 ### 3. FreeRTOS CPU Locking
 The ESP32 is a dual-core chip running a real-time OS (FreeRTOS) that handles background tasks. Background interrupts may distort the precise 200 µs pulse timings.
 * The Fix: The `vTaskSuspendAll()` function is used to lock the CPU for the entire duration of the signal transmission.
 * Watchdog Bypass: Because the entire sequence takes less than the standard 5-second Task Watchdog Timer (TWDT) limit, the sequence completes and resumes normal OS operations without triggering a panic reboot. If longer sequences are needed, the TWDT limit can be configured or it can be fed within the locked section.
+
+### 4. Empirical Timing Analysis
+The 200 µs and 400 µs pulse durations are not based on official documentation. Instead, they were derived through:
+* SDR Capture Analysis: Identifying the most frequent pulse widths in a raw signal capture.
+* Heuristic Refinement: Manually "cleaning" the captured timings to the nearest 50-100 µs intervals to remove capture noise.
+* Verification: Iteratively testing the "guessed" timings against the physical hardware until a most reliable trigger was found.
 
 ---
 
@@ -98,7 +134,7 @@ This project is built using PlatformIO. The RadioLib library is used for CC1101 
 1. Ensure the signal header file is updated with the captured signal timings as described in the previous section.
 2. Change the `upload_port` and `monitor_port` in the `platformio.ini` file to match the tty port assigned to the Wemos LOLIN C3 Mini when connected via USB.
 3. Connect the Wemos LOLIN C3 Mini via USB.
-4. Build and upload the code using `pio run --target upload` (`pio run --target upload --targer monitor` if serial monitor is also desired).
+4. Build and upload the code using `pio run --target upload` (`pio run --target upload --target monitor` if serial monitor is also desired).
 
 ---
 
