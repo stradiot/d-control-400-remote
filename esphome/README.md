@@ -43,9 +43,9 @@ esphome run d-control-400.yaml
 ## 🚦 Status LED Guide
 The onboard RGB LED provides immediate diagnostics:
 
-🔴 Solid Red: Device booting or CC1101 initialization failed.
-🟢 Green Flash: Successful WiFi connection and Radio ready.
-🔵 Solid Blue: Actively transmitting the RF signal burst.
+* 🔴 Solid Red: Device booting or CC1101 initialization failed.
+* 🟢 Green Flash: Successful WiFi connection and Radio ready.
+* 🔵 Solid Blue: Actively transmitting the RF signal burst.
 
 ---
 
