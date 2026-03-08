@@ -4,7 +4,7 @@ This project replicates the control signal for a Dogtrace d-control 400 electric
 
 ⚠️ IMPORTANT PROJECT SCOPE & DISCLAIMERS:
 * Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the precise RF parameters, or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
-* Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR (Software Defined Radio), cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote.
+* Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR, cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote. The signal is transmitted via bit-banging asynchronous timings, mimicking the original system's likely synchronous bit-stream without requiring formal protocol decoding.
 * Device Specific & Template Only: The original signal used to develop this project was specific to my personal remote. It is not a universal signal for all Dogtrace d-control 400 remotes, as each remote likely has a unique identifier embedded in the signal to prevent cross-interference. **For security reasons, my personal signal is encrypted in this repository.** Instead, this code provides a structural template. You must capture your own remote's signal using an SDR and inject it into the code.
 * Beep Only: This repository is currently structured around the sound beep function. It could easily be extended to include the shock function by capturing that specific button press, but that is not the scope of this project at the moment.
 
@@ -15,12 +15,12 @@ This project replicates the control signal for a Dogtrace d-control 400 electric
 Demonstration of the project triggering the collar's sound beep function.
 
 <div align="center">
-  <video src="https://raw.githubusercontent.com/stradiot/d-control-400-remote/main/doc/beep_demo.mp4" width="100%" controls>
-    <p>Your browser does not support the video tag. <a href="doc/beep_demo.mp4">Download the video instead</a>.</p>
+  <video src="https://github.com/user-attachments/assets/9853bdb9-369a-4048-bc43-7c57c0ce9332" controls="controls" style="max-width: 100%;">
   </video>
 </div>
 
-> **Note:** Ensure your volume is up to hear the collar's confirmation beep!
+
+> **Note:** The video contains sound
 
 ---
 
