@@ -1,0 +1,133 @@
+# ======================================================================
+# CORE ESPHOME CONFIGURATION
+# ======================================================================
+esphome:
+  name: d-control-400
+  includes:
+    - cc1101.h
+    - ../include/pinout.h
+    - ../include/signal.h
+  libraries:
+    - SPI
+    - jgromes/RadioLib@^6.0.0
+  on_boot:
+    # Priority 600 runs early in the boot sequence, before Wi-Fi connects
+    priority: 600
+    then:
+      # 1. Immediately turn the LED Solid Red to indicate boot-up
+      - light.turn_on:
+          id: status_led
+          brightness: 50%
+          red: 1.0
+          green: 0.0
+          blue: 0.0
+      # 2. Run the custom C++ CC1101 initialization routine
+      - lambda: 'setup_cc1101();'
+
+esp32:
+  board: lolin_c3_mini
+  framework:
+    type: arduino
+
+# Enable standard Home Assistant API and over-the-air updates
+api:
+logger:
+ota:
+  - platform: esphome
+
+# ======================================================================
+# NETWORK CONFIGURATION
+# ======================================================================
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # CRITICAL HARDWARE FIX: Clamp the Wi-Fi transmit power to prevent
+  # a voltage brownout on the ESP32-C3's tiny voltage regulator.
+  output_power: 8.5dBm
+
+  on_connect:
+    - if:
+        # Check the C++ flag to see if the CC1101 initialized properly
+        condition:
+          lambda: 'return cc1101_is_ready;'
+        then:
+          # SUCCESS: Both Wi-Fi and Radio are good! Flash Green, then turn off.
+          - light.turn_on:
+              id: status_led
+              brightness: 50%
+              red: 0.0
+              green: 1.0
+              blue: 0.0
+          - delay: 500ms
+          - light.turn_off: status_led
+        else:
+          # HARDWARE FAILURE: Radio failed to init. Lock the LED to Solid Red.
+          - light.turn_on:
+              id: status_led
+              brightness: 50%
+              red: 1.0
+              green: 0.0
+              blue: 0.0
+
+# ======================================================================
+# HARDWARE COMPONENTS
+# ======================================================================
+
+# Onboard WS2812B RGB LED (NeoPixel)
+light:
+  - platform: esp32_rmt_led_strip
+    chipset: WS2812
+    rgb_order: GRB
+    pin: 7
+    num_leds: 1
+    name: "Status LED"
+    id: status_led
+    # Disable ESPHome's default 1-second fade animation for instant response
+    default_transition_length: 0s
+    internal: true
+
+# Home Assistant Dashboard Button
+button:
+  - platform: template
+    name: "Trigger Collar Beep"
+    icon: "mdi:volume-high"
+    id: beep_button
+    on_press:
+      - if:
+          # SAFETY CHECK: Only allow transmission if the radio is physically responding
+          condition:
+            lambda: 'return cc1101_is_ready;'
+          then:
+            # 1. Turn LED Blue to indicate transmission
+            - light.turn_on:
+                id: status_led
+                brightness: 80%
+                red: 0.0
+                green: 0.0
+                blue: 1.0
+            # 2. Yield 50ms so ESPHome can physically push the Blue color to the LED
+            - delay: 50ms
+            # 3. Hijack the CPU and bit-bang the SDR timings to the radio
+            - lambda: 'transmit_beep_signal();'
+            # 4. Turn LED off when finished
+            - light.turn_off: status_led
+          else:
+            - logger.log:
+                level: ERROR
+                format: "Cannot transmit: CC1101 Radio is not initialized!"
+
+# Physical BOOT button on the Lolin C3 Mini
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: 9 # GPIO 9 is the standard strapping/boot pin
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Physical Boot Button"
+    internal: true
+    on_press:
+      # Map the physical button press directly to the Home Assistant software button
+      - button.press: beep_button
