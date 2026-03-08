@@ -149,6 +149,14 @@ This project is built using PlatformIO. The RadioLib library is used for CC1101 
 * 🔵 **Solid Blue:** Actively transmitting the RF signal (CPU locked).
 * ⚫ **LED Off:** Standby mode / Ready for input.
 
+---
+
 ## 🎮 Usage
 1. Power up the board and ensure the LED flashes Green, indicating successful CC1101 initialization
 2. Press the BOOT button to transmit the signal. The LED will turn Blue during transmission and then turn off once complete.
+
+---
+
+## ESPHome Integration
+
+Integration to Home Assistant is possible with the ESPHome configuration included in the `esphome/` directory. This allows the device to be triggered remotely, while keeping the option to use the physical BOOT button as a manual trigger. While automations are possible, it is discouraged to trigger the collar remotely without a physical confirmation step, as this could lead to accidental activations.
