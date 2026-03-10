@@ -1,11 +1,11 @@
 # Dogtrace d-control 400 remote clone (ESP32-C3 + CC1101)
 
-This project replicates the control signal for a Dogtrace d-control 400 electric dog collar using a Wemos LOLIN C3 Mini (ESP32-C3) and a CC1101 transceiver module.
+This project replicates the control signal for a Dogtrace d-control 400 electric dog collar using a Wemos LOLIN C3 Mini (ESP32-C3) and a CC1101 transceiver module. The main goal of this project is to create a remote that can be triggered remotely (e.g., via Home Assistant). Integration with Home Assistant is possible through the included ESPHome configuration, allowing for remote triggering of the collar's sound beep function. The project is structured around a single button press (the BOOT button) that triggers the transmission of a raw RF signal captured from the original remote.
 
 ⚠️ IMPORTANT PROJECT SCOPE & DISCLAIMERS:
-* Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the precise RF parameters, or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
+* Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the precise RF parameters, sync word or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
 * Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR, cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote. The signal is transmitted via bit-banging asynchronous timings, mimicking the original system's likely synchronous bit-stream without requiring formal protocol decoding.
-* Device Specific & Template Only: The original signal used to develop this project was specific to my personal remote. It is not a universal signal for all Dogtrace d-control 400 remotes, as each remote likely has a unique identifier embedded in the signal to prevent cross-interference. **For security reasons, my personal signal is encrypted in this repository.** Instead, this code provides a structural template. You must capture your own remote's signal using an SDR and inject it into the code.
+* Device Specific & Template Only: The original signal used to develop this project was specific to my personal remote. It is not a universal signal for all Dogtrace d-control 400 remotes, as each remote likely has a unique identifier embedded in the signal to prevent cross-interference. Instead, this code provides a structural template. To replicate a new remote, its signal has to be captured using an SDR, the timings have to be extracted and cleaned up, and then injected into the code as described in the "Adding Custom Signal" section below.
 * Beep Only: This repository is currently structured around the sound beep function. It could easily be extended to include the shock function by capturing that specific button press, but that is not the scope of this project at the moment.
 
 ---
@@ -116,10 +116,16 @@ To use this project, the RF signal for the specifc remote to be cloned has to be
 
 1. Locate the file include/signal.h in the repository.
 2. Copy-paste the macro below into the file, overwriting its current contents.
-3. Replace the dummy signal data inside with the captured timings (positive numbers for HIGH pulses, negative numbers for LOW gaps)
+3. Replace the dummy signal data with the captured timings (positive numbers for HIGH pulses, negative numbers for LOW gaps)
 
 ```cpp
 #pragma once
+
+#define CARRIER_FREQUENCY 869.525
+#define FREQUENCY_DEVIATION 47.6
+#define OUTPUT_POWER 10
+#define BIT_RATE 100.0
+#define RX_BANDWIDTH 116.0
 
 // Replace the numbers below with your SDR captured timings in microseconds.
 #define SIGNAL_BEEP { \
@@ -160,3 +166,13 @@ This project is built using PlatformIO. The RadioLib library is used for CC1101 
 ## ESPHome Integration
 
 Integration to Home Assistant is possible with the ESPHome configuration included in the `esphome/` directory. This allows the device to be triggered remotely, while keeping the option to use the physical BOOT button as a manual trigger. While automations are possible, it is discouraged to trigger the collar remotely without a physical confirmation step, as this could lead to accidental activations.
+
+> **Note:** If required, the LED status indication can be also exposed to Home Assistant by removing the `internal: true` flag from the `status_led` component in the ESPHome configuration. This allows for remote monitoring of the device's state.
+
+---
+
+## Possible future improvements
+
+* Shock Functionality: Capture the shock button signal and implement it as a separate function.
+* Protocol Reverse Engineering: Attempt to decode the underlying protocol to create a more robust and flexible implementation that can be easily adapted to different remotes without needing raw signal captures.
+
