@@ -8,3 +8,6 @@
 #define BUTTON_PIN 9 // BOOT button
 #define LED_PIN 7    // LOLIN C3 Mini RGB LED
 #define NUMPIXELS 1
+
+#define LED_BRIGHTNESS 50
+#define LED_INDEX 0
