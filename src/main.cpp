@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <SPI.h>
-#include <esp_task_wdt.h>
 #include <Adafruit_NeoPixel.h>
 
 #include "signal.h"
@@ -12,13 +11,25 @@ CC1101 radio = new Module(CC1101_CS, CC1101_GDO0, RADIOLIB_NC, RADIOLIB_NC, cust
 Adafruit_NeoPixel strip(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // --- Dogtrace Signal ---
-const int32_t beepSignal[] = SIGNAL_BEEP;
-const size_t payloadSize = sizeof(beepSignal) / sizeof(beepSignal[0]);
+constexpr int32_t beepSignal[] = SIGNAL_BEEP;
+constexpr size_t payloadSize = sizeof(beepSignal) / sizeof(beepSignal[0]);
 
-// --- Interrupt Variables ---
+// --- Button Interrupt ---
 volatile bool buttonTriggered = false;
 unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 200;
+constexpr unsigned long debounceDelay = 200;
+
+//
+// --- LED Feedback ---
+void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
+    strip.setPixelColor(LED_INDEX, strip.Color(r, g, b));
+    strip.show();
+}
+
+void clearLED() {
+    strip.clear();
+    strip.show();
+}
 
 // --- Interrupt Service Routine ---
 void IRAM_ATTR handleButton() {
@@ -35,9 +46,8 @@ void setup() {
 
     // 1. Initialize RGB LED
     strip.begin();
-    strip.setBrightness(50);
-    strip.clear();
-    strip.show();
+    strip.setBrightness(LED_BRIGHTNESS);
+    clearLED();
 
     // 2. Configure Button and attach Interrupt
     pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -50,19 +60,16 @@ void setup() {
     if (state == RADIOLIB_ERR_NONE) {
         Serial.println(F("CC1101 radio initialized successfully!"));
         // Flash Green to indicate radio is ready
-        strip.setPixelColor(0, strip.Color(0, 255, 0));
-        strip.show();
+        setLEDColor(0, 255, 0); // Green
 
         delay(500);
 
-        strip.clear();
-        strip.show();
+        clearLED();
     } else {
         Serial.print(F("CC1101 radio initialization failed, code: "));
         Serial.println(state);
         // Flash Red if radio fails to initialize
-        strip.setPixelColor(0, strip.Color(255, 0, 0));
-        strip.show();
+        setLEDColor(255, 0, 0); // Red
 
         while (true);
     }
@@ -77,6 +84,8 @@ void setup() {
     radio.standby();
 
     pinMode(CC1101_GDO0, OUTPUT);
+    digitalWrite(CC1101_GDO0, LOW);
+
     Serial.println(F("System Ready. Press BOOT button to transmit."));
 }
 
@@ -85,7 +94,10 @@ void transmitSequence() {
     // If the total transmission time exceeds the watchdog timeout, consider feeding the watchdog here or increasing its timeout duration.
     vTaskSuspendAll();
 
-    for (int r = 0; r < 50; r++) {
+    for (uint16_t repeat = 0; repeat < TRANSMIT_REPEAT; repeat++) {
+        digitalWrite(CC1101_GDO0, LOW);
+        delayMicroseconds(TRANSMIT_GAP_US);
+
         for (size_t i = 0; i < payloadSize; i++) {
             int32_t duration = beepSignal[i];
 
@@ -95,9 +107,6 @@ void transmitSequence() {
             uint32_t target = abs(duration);
             while (micros() - start < target);
         }
-
-        digitalWrite(CC1101_GDO0, LOW);
-        delayMicroseconds(5000); // 5ms gap
     }
 
     // Resume normal system operations
@@ -109,16 +118,14 @@ void loop() {
         Serial.println(F("Button pressed! Transmitting..."));
 
         // Turn RGB LED BLUE while transmitting
-        strip.setPixelColor(0, strip.Color(0, 0, 255));
-        strip.show();
+        setLEDColor(0, 0, 255); // Blue
 
         radio.transmitDirect(); // Enter transparent mode
         transmitSequence();     // Fire the sequence
         radio.standby();        // Back to sleep
 
         // Turn RGB LED OFF after finishing
-        strip.clear();
-        strip.show();
+        clearLED();
 
         buttonTriggered = false; // Reset the flag
         Serial.println(F("Done. Waiting for next press."));

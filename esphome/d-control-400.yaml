@@ -22,7 +22,10 @@ esphome:
           green: 0.0
           blue: 0.0
       # 2. Run the custom C++ CC1101 initialization routine
-      - lambda: 'setup_cc1101();'
+      - lambda: |-
+          if (!cc1101_ctrl::setup()) {
+            ESP_LOGE("cc1101", "CC1101 initialization failed!");
+          }
 
 esp32:
   board: lolin_c3_mini
@@ -50,7 +53,7 @@ wifi:
     - if:
         # Check the C++ flag to see if the CC1101 initialized properly
         condition:
-          lambda: 'return cc1101_is_ready;'
+            lambda: 'return cc1101_ctrl::is_ready();'
         then:
           # SUCCESS: Both Wi-Fi and Radio are good! Flash Green, then turn off.
           - light.turn_on:
@@ -87,17 +90,15 @@ light:
     default_transition_length: 0s
     internal: true
 
-# Home Assistant Dashboard Button
-button:
-  - platform: template
-    name: "Trigger Collar Beep"
-    icon: "mdi:volume-high"
-    id: beep_button
-    on_press:
+# Script to transmit the beep sequence
+script:
+  - id: transmit_beep
+    mode: single
+    then:
       - if:
           # SAFETY CHECK: Only allow transmission if the radio is physically responding
           condition:
-            lambda: 'return cc1101_is_ready;'
+            lambda: 'return cc1101_ctrl::is_ready();'
           then:
             # 1. Turn LED Blue to indicate transmission
             - light.turn_on:
@@ -106,16 +107,37 @@ button:
                 red: 0.0
                 green: 0.0
                 blue: 1.0
-            # 2. Yield 50ms so ESPHome can physically push the Blue color to the LED
-            - delay: 50ms
+            # 2. Yield 500ms so ESPHome can physically push the Blue color to the LED
+            - delay: 500ms
             # 3. Hijack the CPU and bit-bang the SDR timings to the radio
-            - lambda: 'transmit_beep_signal();'
+            - lambda: |-
+                if (!cc1101_ctrl::transmit_beep_signal()) {
+                  ESP_LOGE("cc1101", "Beep signal transmission failed!");
+                }
             # 4. Turn LED off when finished
             - light.turn_off: status_led
           else:
             - logger.log:
                 level: ERROR
                 format: "Cannot transmit: CC1101 Radio is not initialized!"
+      # 5. NEW: Reset the switch back to OFF in Home Assistant only after everything is done
+      - switch.template.publish:
+          id: beep_switch
+          state: OFF
+
+# Home Assistant Dashboard Switch (momentary)
+switch:
+  - platform: template
+    name: "Trigger Collar Beep"
+    icon: "mdi:volume-high"
+    id: beep_switch
+    restore_mode: ALWAYS_OFF
+    optimistic: false
+    turn_on_action:
+      - switch.template.publish:
+          id: beep_switch
+          state: ON
+      - script.execute: transmit_beep
 
 # Physical BOOT button on the Lolin C3 Mini
 binary_sensor:
@@ -130,4 +152,5 @@ binary_sensor:
     internal: true
     on_press:
       # Map the physical button press directly to the Home Assistant software button
-      - button.press: beep_button
+      - switch.turn_on: beep_switch
+
