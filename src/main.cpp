@@ -76,11 +76,10 @@ void setup() {
 
     // 4. Configure CC1101 settings for Dogtrace
     radio.setFrequency(CARRIER_FREQUENCY);
-    radio.setFrequencyDeviation(FREQUENCY_DEVIATION);
     radio.setOutputPower(OUTPUT_POWER);
     radio.setBitRate(BIT_RATE);
     radio.setRxBandwidth(RX_BANDWIDTH);
-    radio.setOOK(false);
+    radio.setOOK(true);
     radio.standby();
 
     pinMode(CC1101_GDO0, OUTPUT);
@@ -95,6 +94,7 @@ void transmitSequence() {
     vTaskSuspendAll();
 
     for (uint16_t repeat = 0; repeat < TRANSMIT_REPEAT; repeat++) {
+        // Ensure PA is OFF during the gap
         digitalWrite(CC1101_GDO0, LOW);
         delayMicroseconds(TRANSMIT_GAP_US);
 

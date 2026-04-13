@@ -3,8 +3,8 @@
 This project replicates the control signal for a Dogtrace d-control 400 electric dog collar using a Wemos LOLIN C3 Mini (ESP32-C3) and a CC1101 transceiver module. The main goal of this project is to create a remote that can be triggered remotely (e.g., via Home Assistant). Integration with Home Assistant is possible through the included ESPHome configuration, allowing for remote triggering of the collar's sound beep function. The project is structured around a single button press (the BOOT button) that triggers the transmission of a raw RF signal captured from the original remote.
 
 ⚠️ IMPORTANT PROJECT SCOPE & DISCLAIMERS:
-* Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the precise RF parameters, sync word or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
-* Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR, cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote. The signal is transmitted via bit-banging asynchronous timings, mimicking the original system's likely synchronous bit-stream without requiring formal protocol decoding.
+* Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the exact RF parameters, sync word, or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
+* Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR, cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote. The signal is transmitted via bit-banging asynchronous timings, mimicking the original system's Pulse Width Modulated (PWM) bit-stream without requiring formal protocol decoding.
 * Device Specific & Template Only: The original signal used to develop this project was specific to my personal remote. It is not a universal signal for all Dogtrace d-control 400 remotes, as each remote likely has a unique identifier embedded in the signal to prevent cross-interference. Instead, this code provides a structural template. To replicate a new remote, its signal has to be captured using an SDR, the timings have to be extracted and cleaned up, and then injected into the code as described in the "Adding Custom Signal" section below.
 * Beep Only: This repository is currently structured around the sound beep function. It could easily be extended to include the shock function by capturing that specific button press, but that is not the scope of this project at the moment.
 
@@ -70,39 +70,38 @@ graph LR
 
 ## 📡 CC1101 RF Configuration Summary
 
-These RF parameters were fine-tuned through iterative testing to reliably trigger the collar. They may not be the exact parameters used by the original remote, but they work effectively for raw pulse transmission. Only the carrier frequency is based on the datasheet, the rest were derived empirically and through SDR analysis.
+These RF parameters were fine-tuned through SDR analysis and iterative testing to reliably trigger the collar. Only the carrier frequency is based on the datasheet; the rest were derived empirically to match the original remote's physical transmission characteristics.
 
 | Parameter | Value | Why it matters |
 | :--- | :--- | :--- |
-| Carrier Frequency | 869.525 MHz | The exact frequency the Dogtrace collar is listening to. Given by datasheet. |
-| Modulation | 2-FSK | Maybe also GFSK, but 2-FSK works. |
-| Frequency Deviation | 47.6 kHz | Worked best, but may be adjusted. |
-| Bit Rate | 100.0 kbps | 20x oversampling of the 5kbps signal to eliminate jitter. |
-| Rx Bandwidth | 116.0 kHz | Derived from the deviation, based on the Carson’s Rule and set to the closest hardware filter step for a 26MHz crystal with some extra space. |
+| Carrier Frequency | 869.525 MHz | The exact frequency the Dogtrace collar is listening to. Given by datasheet and confirmed via SDR. |
+| Modulation | OOK (On-Off Keying) | Confirmed via SDR waterfall. The collar uses simple Amplitude Modulation (power on/off). |
+| Bit Rate | 100.0 kbps | 20x oversampling of the ~5kbps signal to eliminate jitter. |
+| Rx Bandwidth | 116.0 kHz | Standard hardware filter step for a 26MHz crystal to ensure stable internal clock division. |
 | Sync Word | Disabled | Bit-banging raw pulses; no hardware packet handling. |
 | Preamble/CRC | Disabled | Bypasses the CC1101 packet engine for "Asynchronous Mode." |
-| Transmission Mode| Asynchronous | Maps the physical state of GDO0 directly to the RF output. |
-| Pulse Timings | ~200/400 µs | Empirical: Guessed from SDR capture and verified by trial. |
+| Transmission Mode| Asynchronous | Maps the physical state of GDO0 directly to the RF Power Amplifier (HIGH = RF ON, LOW = RF OFF). |
+| Pulse Timings | ~200/400 µs | Empirical: Derived from SDR Pulse Width Modulation (PWM) capture and verified by trial. |
 
 ---
 
 ## 🚀 Technical Specifics
 
 ### 1. 20x Bitrate Oversampling
-The actual data rate of the 200 µs pulses is 5.0 kBaud. However, the CC1101's internal data rate register is deliberately cranked to 100.0 kbps.
-* In Asynchronous mode, the CC1101 samples the GDO0 pin based on its internal clock. At 5 kbps, it only samples every 200 µs, causing massive timing jitter. Oversampling at 100 kbps forces the chip to sample the pin every 10 µs, eliminating jitter and forcing the frequency synthesizer to slew between frequencies instantly, creating crisp square waves.
+The actual data rate of the 200 µs pulses is roughly 5.0 kBaud. However, the CC1101's internal data rate register is deliberately cranked to 100.0 kbps.
+* In Asynchronous mode, the CC1101 samples the GDO0 pin based on its internal clock. At 5 kbps, it only samples every 200 µs, causing massive timing jitter. Oversampling at 100 kbps forces the chip to sample the pin every 10 µs. This ensures the Power Amplifier gates on and off instantly, creating crisp, perfectly timed OOK square waves.
 
-### 2. Bandwidth Tuning
-Receiver bandwidth (RxBandwidth) is set to 116.0 kHz even though the project only implements a transmitter. This ensures the internal clock tree and frequency synthesizer have enough "room" to instantly shift the 47.6 kHz deviation without clipping or rounding the signal edges. The value of 116.0 kHz is the closest available hardware filter tap provided by the CC1101's internal clock dividers (based on a 26 MHz crystal) that safely encompasses our signal's occupied bandwidth.
+### 2. Bandwidth and Clock Stability
+While this project only transmits, setting the receiver bandwidth (`RxBandwidth`) to 116.0 kHz selects a stable, pre-defined hardware filter tap provided by the CC1101's internal clock dividers (based on a 26 MHz crystal). In OOK mode, the frequency synthesizer stays locked dead-center at 869.525 MHz, but a stable internal clock tree ensures the RF bursts are clean and consistent.
 
 ### 3. FreeRTOS CPU Locking
-The ESP32 is a dual-core chip running a real-time OS (FreeRTOS) that handles background tasks. Background interrupts may distort the precise 200 µs pulse timings.
+The ESP32 is a dual-core chip running a real-time OS (FreeRTOS) that handles background tasks. Background interrupts may distort the precise microsecond pulse timings required to fool the collar.
 * The Fix: The `vTaskSuspendAll()` function is used to lock the CPU for the entire duration of the signal transmission.
 * Watchdog Bypass: Because the entire sequence takes less than the standard 5-second Task Watchdog Timer (TWDT) limit, the sequence completes and resumes normal OS operations without triggering a panic reboot. If longer sequences are needed, the TWDT limit can be configured or it can be fed within the locked section.
 
 ### 4. Empirical Timing Analysis
 The 200 µs and 400 µs pulse durations are not based on official documentation. Instead, they were derived through:
-* SDR Capture Analysis: Identifying the most frequent pulse widths in a raw signal capture.
+* SDR Capture Analysis: Identifying the Pulse Width Modulation (PWM) duty cycle in a raw Amplitude Modulated (AM) signal capture.
 * Heuristic Refinement: Manually "cleaning" the captured timings to the nearest 50-100 µs intervals to remove capture noise.
 * Verification: Iteratively testing the "guessed" timings against the physical hardware until a most reliable trigger was found.
 
@@ -112,17 +111,16 @@ The 200 µs and 400 µs pulse durations are not based on official documentation.
 
 For security and safety reasons, the actual payload timings for my personal dog collar are stored encrypted.
 
-To use this project, the RF signal for the specifc remote to be cloned has to be captured using an SDR (Software Defined Radio) and the captured microsecond timings have to be injected into the code.
+To use this project, the RF signal for the specific remote to be cloned has to be captured using an SDR (Software Defined Radio) set to AM/ASK mode. The captured microsecond timings then have to be injected into the code.
 
-1. Locate the file include/signal.h in the repository.
+1. Locate the file `include/signal.h` in the repository.
 2. Copy-paste the macro below into the file, overwriting its current contents.
-3. Replace the dummy signal data with the captured timings (positive numbers for HIGH pulses, negative numbers for LOW gaps)
+3. Replace the dummy signal data with your captured timings (positive numbers for HIGH/RF ON, negative numbers for LOW/Silence).
 
 ```cpp
 #pragma once
 
 #define CARRIER_FREQUENCY 869.525
-#define FREQUENCY_DEVIATION 47.6
 #define OUTPUT_POWER 10
 #define BIT_RATE 100.0
 #define RX_BANDWIDTH 116.0
