@@ -62,11 +62,10 @@ namespace cc1101_ctrl {
 
             bool config_ok = true;
             config_ok = config_ok && (radio->setFrequency(CARRIER_FREQUENCY) == RADIOLIB_ERR_NONE);
-            config_ok = config_ok && (radio->setFrequencyDeviation(FREQUENCY_DEVIATION) == RADIOLIB_ERR_NONE);
             config_ok = config_ok && (radio->setOutputPower(OUTPUT_POWER) == RADIOLIB_ERR_NONE);
             config_ok = config_ok && (radio->setBitRate(BIT_RATE) == RADIOLIB_ERR_NONE);
             config_ok = config_ok && (radio->setRxBandwidth(RX_BANDWIDTH) == RADIOLIB_ERR_NONE);
-            config_ok = config_ok && (radio->setOOK(false) == RADIOLIB_ERR_NONE);
+            config_ok = config_ok && (radio->setOOK(true) == RADIOLIB_ERR_NONE);
             config_ok = config_ok && (radio->standby() == RADIOLIB_ERR_NONE);
 
             if (!config_ok) {
