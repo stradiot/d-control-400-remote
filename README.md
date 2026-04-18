@@ -16,7 +16,7 @@ Demonstration of the project triggering the collar's sound beep function.
 
 
 <div align="center">
-  <video src="https://github.com/user-attachments/assets/04d82808-d1b9-443d-9fe7-df2eb6059583" controls="controls" style="max-width: 100%;">
+  <video src="https://github.com/user-attachments/assets/95b2df5f-6e3d-44ce-ad21-af88bca1a0c2" controls="controls" style="max-width: 100%;">
   </video>
 </div>
 
