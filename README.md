@@ -14,8 +14,9 @@ This project replicates the control signal for a Dogtrace d-control 400 electric
 
 Demonstration of the project triggering the collar's sound beep function.
 
+
 <div align="center">
-  <video src="https://github.com/user-attachments/assets/9853bdb9-369a-4048-bc43-7c57c0ce9332" controls="controls" style="max-width: 100%;">
+  <video src="https://github.com/user-attachments/assets/04d82808-d1b9-443d-9fe7-df2eb6059583" controls="controls" style="max-width: 100%;">
   </video>
 </div>
 
