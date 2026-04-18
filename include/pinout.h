@@ -1,9 +1,9 @@
 // --- Pin Definitions ---
-#define CC1101_MOSI 0
-#define CC1101_CS   1
-#define CC1101_GDO0 3
-#define CC1101_SCK  4
-#define CC1101_MISO 5
+#define CC1101_MISO 0
+#define CC1101_MOSI 3
+#define CC1101_CS   10
+#define CC1101_SCK  1
+#define CC1101_GDO0 8
 
 #define BUTTON_PIN 9 // BOOT button
 #define LED_PIN 7    // LOLIN C3 Mini RGB LED
