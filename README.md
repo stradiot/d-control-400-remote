@@ -69,7 +69,7 @@ graph LR
     G10 ---|SPI CS| CSN
     G9 ---|BOOT Button| BUTTON_PIN
     G7 ---|RGB LED| LED_PIN
-
+```
 ---
 
 ## 📡 CC1101 RF Configuration Summary
