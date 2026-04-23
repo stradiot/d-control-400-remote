@@ -41,11 +41,13 @@ graph LR
     subgraph Wemos LOLIN C3 Mini
         3V3[3.3V Power]
         GND[Ground]
-        G0[GPIO 0]
-        G4[GPIO 4]
-        G5[GPIO 5]
         G3[GPIO 3]
         G1[GPIO 1]
+        G0[GPIO 0]
+        G8[GPIO 8]
+        G10[GPIO 10]
+        G9[GPIO 9]
+        G7[GPIO 7]
     end
 
     subgraph CC1101 Module
@@ -60,12 +62,13 @@ graph LR
 
     3V3 ---|Power| VCC_C
     GND ---|Ground| GND_C
-    G0 ---|SPI Data In| MOSI
-    G1 ---|Chip Select| CSN
-    G3 ---|Async TX Bit-Bang| GDO0
-    G4 ---|SPI Clock| SCK
-    G5 ---|SPI Data Out| MISO
-```
+    G3 ---|SPI MOSI| MOSI
+    G1 ---|SPI SCK| SCK
+    G0 ---|SPI MISO| MISO
+    G8 ---|GDO0| GDO0
+    G10 ---|SPI CS| CSN
+    G9 ---|BOOT Button| BUTTON_PIN
+    G7 ---|RGB LED| LED_PIN
 
 ---
 
