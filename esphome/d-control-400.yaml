@@ -34,6 +34,8 @@ esp32:
 
 # Enable standard Home Assistant API and over-the-air updates
 api:
+  encryption:
+    key: !secret api_encryption_key
 logger:
 ota:
   - platform: esphome
