@@ -25,6 +25,22 @@ Demonstration of the project triggering the collar's sound beep function.
 
 ---
 
+## 📁 Repository Structure
+
+```
+.
+├── src/          # Firmware source (main.cpp — button handling, LED feedback, TX sequence)
+├── include/      # Headers: pinout.h (pin map) and signal.h (RF params + captured payload, encrypted)
+├── esphome/      # ESPHome configuration for Home Assistant integration
+├── pcb/          # Fabrication-ready PCB Gerber files (gerber.zip)
+├── enclosure/    # 3D printable enclosure models (CAD sources + STL/3MF)
+├── doc/          # Media assets (demo video)
+├── platformio.ini # PlatformIO project/build configuration
+└── README.md
+```
+
+---
+
 ## Hardware Requirements
 * Microcontroller: Wemos LOLIN C3 Mini (ESP32-C3).
 * Radio: CC1101 Transceiver Module (Must be the 868 MHz version, 26 MHz crystal).
@@ -72,6 +88,33 @@ graph LR
 ```
 ---
 
+## 🧩 PCB
+
+For a cleaner build than hand-wiring, a fabrication-ready PCB is included at `pcb/gerber.zip`. It routes the SPI bus and control pins between the Wemos LOLIN C3 Mini and the CC1101 module exactly as shown in the wiring diagram above.
+
+* Upload `pcb/gerber.zip` directly to any PCB fab house (JLCPCB, PCBWay, OSH Park, etc.) to have the boards manufactured.
+* Hand-wiring per the diagram above remains a fully valid alternative — the PCB is optional.
+
+### Layout & Components
+* **Module placement:** The Lolin C3 Mini and the CC1101 RF module are placed strategically so the RF module's antenna overhangs completely past the edge of the board, giving it clear space to radiate without the board substrate detuning or absorbing the signal.
+* **ESP antenna optimization:** A deliberate copper-pour keepout was created under the ESP32's onboard antenna on **both** layers, eliminating interference and letting it transmit through clean laminate.
+* **Mounting holes:** The corners carry mounting holes with a precise **2.032 mm** diameter; the copper pour flows around them with a safety clearance to prevent shorts from mounting hardware.
+* **Verified footprint:** The radio's pin pitch was designed and verified at 2.00 mm (matching the `header-pin-1x8-2.00` standard).
+
+### Routing & Electrical Integrity (DRC)
+* **Differentiated track widths:** The power trace (from the 3.3V pin) is deliberately sized to **0.5 mm** for better current capacity and stability, noticeably wider than the data/signal traces, which are a precise **0.254 mm**.
+* **GND net integrity:** Ground pins connect to a full-coverage copper polygon pour via thermal reliefs — ensuring a solid ground connection while still making the pads easy to hand-solder.
+* **CC1101 asynchronous mode:** For asynchronous signal transmission only the **GDO0** pin is wired and used; GDO2 is left unconnected.
+* **Design Rule Check:** The manufacturing rules for minimum track width were tuned to the actual design so the board passes automated DRC cleanly.
+
+### Manufacturing / Gerber Parameters
+* **Export:** Standard Gerber files, provided as `gerber.zip`.
+* **Stackup & finish:** FR-4, 2 layers, 1.6 mm thickness, 1 oz copper. Surface finish is **HASL (with lead)** for easier wetting with leaded solder during hand assembly.
+* **Solder mask:** Black.
+* **Fab marks:** "Remove Order Number" was selected so the fab does not print its production code on the board, preserving the minimalist look of the prototype.
+
+---
+
 ## 📡 CC1101 RF Configuration Summary
 
 These RF parameters were fine-tuned through SDR analysis and iterative testing to reliably trigger the collar. Only the carrier frequency is based on the datasheet; the rest were derived empirically to match the original remote's physical transmission characteristics.
@@ -79,6 +122,7 @@ These RF parameters were fine-tuned through SDR analysis and iterative testing t
 | Parameter | Value | Why it matters |
 | :--- | :--- | :--- |
 | Carrier Frequency | 869.525 MHz | The exact frequency the Dogtrace collar is listening to. Given by datasheet and confirmed via SDR. |
+| Output Power | 10 dBm | Transmit power of the CC1101 Power Amplifier. Sufficient for reliable close-range triggering. |
 | Modulation | OOK (On-Off Keying) | Confirmed via SDR waterfall. The collar uses simple Amplitude Modulation (power on/off). |
 | Bit Rate | 100.0 kbps | 20x oversampling of the ~5kbps signal to eliminate jitter. |
 | Rx Bandwidth | 116.0 kHz | Standard hardware filter step for a 26MHz crystal to ensure stable internal clock division. |
@@ -103,7 +147,13 @@ The ESP32 is a dual-core chip running a real-time OS (FreeRTOS) that handles bac
 * The Fix: The `vTaskSuspendAll()` function is used to lock the CPU for the entire duration of the signal transmission.
 * Watchdog Bypass: Because the entire sequence takes less than the standard 5-second Task Watchdog Timer (TWDT) limit, the sequence completes and resumes normal OS operations without triggering a panic reboot. If longer sequences are needed, the TWDT limit can be configured or it can be fed within the locked section.
 
-### 4. Empirical Timing Analysis
+### 4. Repeated Transmission
+A single button press does not send the signal just once. The full `SIGNAL_BEEP` sequence is transmitted `TRANSMIT_REPEAT` (50) times in a row, with a `TRANSMIT_GAP_US` (5000 µs) Power-Amplifier-off gap between each repeat.
+* Beep duration: The collar beeps for as long as it keeps receiving the signal, so the repeat count directly controls how long the beep lasts. Increase `TRANSMIT_REPEAT` for a longer beep, decrease it for a shorter one.
+* Reliability: Repeating the burst also maximizes the chance that the collar's receiver cleanly captures at least one complete, correctly-timed sequence, and the gap gives it a clear idle period to detect the start of each new burst.
+* The entire loop runs inside the `vTaskSuspendAll()` locked section (see the FreeRTOS CPU Locking note above) and still completes well within the 5-second watchdog window.
+
+### 5. Empirical Timing Analysis
 The 200 µs and 400 µs pulse durations are not based on official documentation. Instead, they were derived through:
 * SDR Capture Analysis: Identifying the Pulse Width Modulation (PWM) duty cycle in a raw Amplitude Modulated (AM) signal capture.
 * Heuristic Refinement: Manually "cleaning" the captured timings to the nearest 50-100 µs intervals to remove capture noise.
@@ -113,7 +163,7 @@ The 200 µs and 400 µs pulse durations are not based on official documentation.
 
 ## 🔑 Adding Custom Signal (Payload Configuration)
 
-For security and safety reasons, the actual payload timings for my personal dog collar are stored encrypted.
+For security and safety reasons, the actual payload timings for my personal dog collar are stored encrypted (via [SOPS](https://github.com/getsops/sops) + age). This means the `include/signal.h` file shipped in a fresh clone contains encrypted ciphertext, **not** valid C code — the project will not compile until you replace it with your own captured signal as described below.
 
 To use this project, the RF signal for the specific remote to be cloned has to be captured using an SDR (Software Defined Radio) set to AM/ASK mode. The captured microsecond timings then have to be injected into the code.
 
@@ -124,16 +174,20 @@ To use this project, the RF signal for the specific remote to be cloned has to b
 ```cpp
 #pragma once
 
-#define CARRIER_FREQUENCY 869.525
-#define OUTPUT_POWER 10
-#define BIT_RATE 100.0
-#define RX_BANDWIDTH 116.0
+#define CARRIER_FREQUENCY 869.525 // Carrier frequency in MHz
+#define OUTPUT_POWER 10           // CC1101 transmit power in dBm
+#define BIT_RATE 100.0            // Async oversampling rate in kbps
+#define RX_BANDWIDTH 116.0        // Receiver filter bandwidth in kHz
+#define TRANSMIT_REPEAT 50        // Times the full sequence is re-sent per trigger (also sets beep duration)
+#define TRANSMIT_GAP_US 5000      // PA-off gap in microseconds between each repeat
 
 // Replace the numbers below with your SDR captured timings in microseconds.
 #define SIGNAL_BEEP { \
   200, -200, 400, -400, 200, -200, ... \
 }
 ```
+
+> **Note:** Keep the `TRANSMIT_REPEAT` and `TRANSMIT_GAP_US` macros — they are required by `src/main.cpp` and the code will not compile without them. See the "Repeated Transmission" note under Technical Specifics for what they do.
 
 ---
 
@@ -149,8 +203,7 @@ This project is built using PlatformIO. The RadioLib library is used for CC1101 
 ---
 
 ## 🚥 Status Indication
-* After the board is powered up, the onboard RGB LED will flash Green if the CC1101 initializes correctly over SPI. If it fails to initialize, the LED will turn and stay Red intead, indicating a wiring or hardware issue.
-* Pressing the BOOT button on the C3 Mini triggers the signal transmission. During this transmission the LED will turn Blue, after the full seqeuence is transmitted the LED will turn off.
+The onboard RGB LED reports the device state:
 
 * 🟢 **Solid Green (0.5s):** Power on / CC1101 Radio initialized successfully.
 * 🔴 **Solid Red:** Radio initialization failed (Check your SPI wiring).
@@ -162,6 +215,34 @@ This project is built using PlatformIO. The RadioLib library is used for CC1101 
 ## 🎮 Usage
 1. Power up the board and ensure the LED flashes Green, indicating successful CC1101 initialization
 2. Press the BOOT button to transmit the signal. The LED will turn Blue during transmission and then turn off once complete.
+
+---
+
+## 🖨️ 3D Printed Enclosure
+
+The `enclosure/` directory contains parametric CAD models and ready-to-print files for a protective case that houses the device. The design is optimized for FDM 3D printing without supports and uses a friction-fit joint to secure the lid.
+
+**Directory contents:**
+
+| File | Format | Purpose |
+| :--- | :--- | :--- |
+| `enclosure/d-control-400-remote-enclosure.f3d` | F3D | Source parametric archive from Fusion 360 (includes full timeline and sketches). |
+| `enclosure/d-control-400-remote-enclosure.step` | STEP | Universal CAD model (useful for collision checks directly in PCB/EDA software). |
+| `enclosure/d-control-400-enclosure.3mf` | 3MF | PrusaSlicer project with preset orientation and print profiles. |
+| `enclosure/d-control-400-case.stl` | STL | Exported mesh of the case body for direct printing. |
+| `enclosure/d-control-400-lid.stl` | STL | Exported mesh of the lid for direct printing. |
+
+**Recommended print settings (Prusa MK4):**
+* **Material:** PLA
+* **Profile:** `0.20mm STRUCTURAL (Input Shaper)` — *Critical for holding the tight dimensional tolerance of the friction-fit joint (-0.1 mm).*
+* **Nozzle:** 0.4 mm
+* **Supports:** None — *The USB-C connector cutout (13×7 mm) is designed so the printer can bridge it cleanly without supports.*
+* **Part orientation:**
+  * **Case:** Flat bottom directly on the build plate.
+  * **Lid:** Outer face (with the centered recessed text) directly on the build plate for a smooth finish.
+
+**Assembly and disassembly:**
+The lid slides into the case until fully seated and is held in place by the interference fit. For safe and easy opening, a hidden pry slot (screwdriver slot) with an internal fillet is located on the top edge of the case's rear wall. To pop the lid off, simply insert a standard 5 mm flat-head screwdriver into the slot and lever it open.
 
 ---
 
@@ -177,4 +258,10 @@ Integration to Home Assistant is possible with the ESPHome configuration include
 
 * Shock Functionality: Capture the shock button signal and implement it as a separate function.
 * Protocol Reverse Engineering: Attempt to decode the underlying protocol to create a more robust and flexible implementation that can be easily adapted to different remotes without needing raw signal captures.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details. The software is provided "as is", without warranty of any kind; use it responsibly and at your own risk, keeping the safety disclaimers at the top of this document in mind.
 
