@@ -222,6 +222,10 @@ The onboard RGB LED reports the device state:
 
 The `enclosure/` directory contains parametric CAD models and ready-to-print files for a protective case that houses the device. The design is optimized for FDM 3D printing without supports and uses a friction-fit joint to secure the lid.
 
+| Closed | Open |
+| :---: | :---: |
+| ![Enclosure closed](doc/enclosure-closed.png) | ![Enclosure open showing the PCB inside](doc/enclosure-open.png) |
+
 **Directory contents:**
 
 | File | Format | Purpose |
