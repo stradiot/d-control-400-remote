@@ -26,8 +26,9 @@ namespace cc1101_ctrl {
     CC1101* radio = nullptr;
     bool radio_ready = false;
 
-    constexpr int32_t beep_signal[] = SIGNAL_BEEP;
-    constexpr size_t payload_size = sizeof(beep_signal) / sizeof(beep_signal[0]);
+    // Run lengths in BASE_TICK_US units. Positive = RF ON, negative = RF OFF.
+    constexpr int32_t beep_ticks[] = SIGNAL_BEEP_TICKS;
+    constexpr size_t payload_size = sizeof(beep_ticks) / sizeof(beep_ticks[0]);
 
     inline bool setup() {
         if (radio_ready) {
@@ -93,7 +94,13 @@ namespace cc1101_ctrl {
     // TRANSMISSION ROUTINE
     // Bit-bangs the SDR timings directly into the CC1101 via GDO0.
     // ---------------------------------------------------------------------
-    inline bool transmit_beep_signal() {
+    // One burst = FRAMES_PER_BURST frames emitted back-to-back with NO gap, which is
+    // how the remote actually transmits. The gap goes between bursts only; putting one
+    // between frames stops the collar decoding at all (see signal.h).
+    //
+    // bursts defaults to TRANSMIT_REPEAT; pass a smaller count for a shorter beep,
+    // since the collar sounds for as long as it keeps receiving frames.
+    inline bool transmit_beep_signal(uint16_t bursts = TRANSMIT_REPEAT) {
         if (!radio_ready || radio == nullptr) {
             ESP_LOGE("CC1101", "Radio not ready for transmission");
             return false;
@@ -105,27 +112,59 @@ namespace cc1101_ctrl {
         }
         delay(5); // Stabilize synthesizer
 
-        for (int repeat = 0; repeat < TRANSMIT_REPEAT; ++repeat) {
+        for (uint16_t burst = 0; burst < bursts; ++burst) {
 
-            // LOCK THE CPU: Suspend the ESP32 OS to guarantee microsecond accuracy
+            // LOCK THE CPU: Suspend the ESP32 OS to guarantee microsecond accuracy.
+            // Held for the whole burst (~159 ms at FRAMES_PER_BURST 7), not per frame --
+            // resuming the scheduler mid-burst is what would inject the fatal gap.
+            // Well inside the 5 s task watchdog; interrupts still run while suspended.
             vTaskSuspendAll();
 
-            // Iterate through the positive (HIGH) and negative (LOW) microsecond timings
-            for (size_t i = 0; i < payload_size; ++i) {
-                int duration = beep_signal[i];
+            // Every edge is scheduled against one absolute timebase taken at the start
+            // of the burst, so the per-edge digitalWrite() cost does not integrate over
+            // 616 edges. Sampling micros() after each write instead would stretch every
+            // tick by the write overhead -- tolerable over one 22.8 ms frame, not over a
+            // 159 ms burst. The cast to int32_t makes the comparison rollover-safe.
+            uint32_t next = micros();
+            for (uint16_t frame = 0; frame < FRAMES_PER_BURST; ++frame) {
+                for (size_t i = 0; i < payload_size; ++i) {
+                    int ticks = beep_ticks[i];
 
-                 // Positive durations set HIGH, negative durations set LOW
-                digitalWrite(CC1101_GDO0, duration > 0 ? HIGH : LOW);
-                 // Use absolute value for delay duration
-                delayMicroseconds(std::abs(duration));
+                    // Positive run lengths set HIGH, negative set LOW
+                    digitalWrite(CC1101_GDO0, ticks > 0 ? HIGH : LOW);
+                    // Absolute run length scaled to microseconds by the symbol period
+                    next += (uint32_t)std::abs(ticks) * BASE_TICK_US;
+                    while ((int32_t)(micros() - next) < 0) {
+                    }
+                }
             }
-            // Ensure the transmitter pin is safely pulled LOW after the array finishes
+            // Ensure the transmitter pin is safely pulled LOW after the burst finishes
             digitalWrite(CC1101_GDO0, LOW);
 
             // UNLOCK THE CPU: Allow ESPHome to process Wi-Fi and background tasks
             xTaskResumeAll();
-            // 5ms gap between signal bursts
-            delay(5);
+
+            // Feed the task watchdog explicitly rather than relying on the idle task
+            // getting scheduled inside the gap. Wi-Fi and lwIP sit at far higher
+            // priority than idle and can consume the whole window servicing the
+            // backlog that built up while the scheduler was suspended.
+            esphome::App.feed_wdt();
+
+            // Inter-BURST gap, from signal.h. delay() yields to the scheduler and is
+            // what actually lets ESPHome service Wi-Fi between bursts; delayMicroseconds()
+            // busy-waits, so only the sub-millisecond remainder goes through it. With the
+            // gap at 0 a bare yield() still hands over a slot.
+            constexpr uint32_t gap_ms = TRANSMIT_GAP_US / 1000;
+            constexpr uint32_t gap_rem_us = TRANSMIT_GAP_US % 1000;
+            if (gap_ms > 0) {
+                delay(gap_ms);
+            }
+            if (gap_rem_us > 0) {
+                delayMicroseconds(gap_rem_us);
+            }
+            if (TRANSMIT_GAP_US == 0) {
+                yield();
+            }
         }
 
         if (radio->standby() != RADIOLIB_ERR_NONE) {

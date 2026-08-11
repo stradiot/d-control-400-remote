@@ -14,6 +14,11 @@ esphome:
     # Priority 600 runs early in the boot sequence, before Wi-Fi connects
     priority: 600
     then:
+      # 0. Report why the chip last reset (see the log_reset_reason script).
+      #    on_boot runs before Wi-Fi is up, so this line only ever lands on the
+      #    USB serial console; the api on_client_connected trigger below repeats
+      #    it for the network log, which is where it actually gets read.
+      - script.execute: log_reset_reason
       # 1. Immediately turn the LED Solid Red to indicate boot-up
       - light.turn_on:
           id: status_led
@@ -36,6 +41,11 @@ esp32:
 api:
   encryption:
     key: !secret api_encryption_key
+  # Repeat the reset reason whenever a client attaches, so `esphome logs` sees it
+  # even though it connects long after on_boot has run. esp_reset_reason() reads a
+  # latched RTC register, so it stays valid for the whole boot and can be re-read.
+  on_client_connected:
+    - script.execute: log_reset_reason
 logger:
 ota:
   - platform: esphome
@@ -92,8 +102,32 @@ light:
     default_transition_length: 0s
     internal: true
 
-# Script to transmit the beep sequence
 script:
+  # Why the chip last reset. The ROM prints this on UART0 at boot, but those
+  # messages never reach the network log, so re-emit it as a normal log line.
+  #   BROWNOUT           -> the supply rail sagged; PA duty is too high for the LDO
+  #   TASK_WDT / INT_WDT -> the scheduler was starved by vTaskSuspendAll()
+  # The two have opposite fixes, which is the whole reason for logging it.
+  - id: log_reset_reason
+    mode: single
+    then:
+      - lambda: |-
+          const char *why;
+          switch (esp_reset_reason()) {
+            case ESP_RST_POWERON:   why = "POWERON (normal cold boot)"; break;
+            case ESP_RST_SW:        why = "SW (esp_restart, e.g. OTA)"; break;
+            case ESP_RST_PANIC:     why = "PANIC (exception / abort)"; break;
+            case ESP_RST_INT_WDT:   why = "INT_WDT (interrupt watchdog)"; break;
+            case ESP_RST_TASK_WDT:  why = "TASK_WDT (task watchdog)"; break;
+            case ESP_RST_WDT:       why = "WDT (other watchdog)"; break;
+            case ESP_RST_BROWNOUT:  why = "BROWNOUT (supply rail sagged)"; break;
+            case ESP_RST_EXT:       why = "EXT (reset pin)"; break;
+            case ESP_RST_DEEPSLEEP: why = "DEEPSLEEP"; break;
+            default:                why = "UNKNOWN"; break;
+          }
+          ESP_LOGW("boot", "last reset reason: %s", why);
+
+  # Script to transmit the beep sequence
   - id: transmit_beep
     mode: single
     then:
