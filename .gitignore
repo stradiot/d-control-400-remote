@@ -1,2 +1,4 @@
 .pio
 *.bgcode
+.DS_Store
+__pycache__/
