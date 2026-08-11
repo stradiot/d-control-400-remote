@@ -129,7 +129,7 @@ These RF parameters were fine-tuned through SDR analysis and iterative testing t
 | Sync Word | Disabled | Bit-banging raw pulses; no hardware packet handling. |
 | Preamble/CRC | Disabled | Bypasses the CC1101 packet engine for "Asynchronous Mode." |
 | Transmission Mode| Asynchronous | Maps the physical state of GDO0 directly to the RF Power Amplifier (HIGH = RF ON, LOW = RF OFF). |
-| Symbol Period | 208.875 µs (stored as 209) | Measured from SDR capture across 13 presses, not rounded. Every run length is 1 or 2 of these. See "Empirical Timing Analysis". |
+| Symbol Period | 208.647 µs (stored as 209) | Measured from SDR capture across 13 presses, not rounded. Every run length is 1 or 2 of these. See "Empirical Timing Analysis". |
 
 ---
 
@@ -167,12 +167,19 @@ The three knobs are therefore layered and interdependent:
 Raising `FRAMES_PER_BURST` means feeding the watchdog more often, or the device resets.
 
 ### 5. Empirical Timing Analysis
-The symbol period is **208.875 µs**, stored as `209`. It was measured, not guessed, from three RTL-SDR captures at 2.000 MSps covering 13 button presses:
-* **Rise-to-rise across the preamble** — 417.75 samples per period, steady to ±0.5.
-* **Hand measurement in URH** at 50% crossings on both edges. Measuring edge-to-edge instead biases high by the rise and fall time; taking both at the 50% crossing cancels it.
-* **Verification**: every run in every capture quantises onto that grid, with zero off-grid elements.
+The symbol period is **208.647 µs**, stored as `209`. It was measured, not guessed, from three RTL-SDR captures at 2.000 MSps covering 13 button presses.
 
-An earlier version of this project used 200 µs, which is 4.5% fast. Note the trap: URH's *Autodetect parameters* reports 400 samples/symbol here, wrong by 9%, because it fits a symbol length rather than measuring one. Hand measurement caught it.
+**Measure frame-start to frame-start.** Take the rising edge that opens the first frame and the rising edge that opens the seventh: 272 910 samples spanning exactly 654 ticks, giving 417.294 samples per tick. The six intermediate estimates agree to within 0.02%.
+
+Two things make this the right baseline, and both are about the *endpoints* rather than the span:
+* Both endpoints are **rising edges at the same structural position**, so rise-time bias is identical at each end and cancels instead of accumulating. (Measuring edge-to-edge on a single pulse biases high by the rise and fall time; taking both ends at the 50% crossing is the equivalent fix at small scale.)
+* There is **no ambiguity about where the message ends.** The final ON tick is cut short when the button is released, so dividing the whole message span by its tick count leaves you unable to say whether the denominator is 763 or 764 — a 0.13% uncertainty you simply don't incur.
+
+An earlier measurement across 42 preamble ticks gave 417.75, which is 0.11% high: a 16× shorter baseline carries 16× the endpoint error. An earlier version of this project used 200 µs, which is 4.5% fast.
+
+⚠️ URH's *Autodetect parameters* reports 400 samples/symbol here — wrong by 9% — because it fits a symbol length rather than measuring one. Hand measurement caught it.
+
+**Independently reproduced by hand**, with no scripting: URH set to ASK, Samples/Symbol 418, Error tolerance 5, Bits/Symbol 1, yielding 764 bits — this frame seven times over with zero mismatches. Worth knowing: at Error tolerance 0 the same capture silently loses five bits and produces seven frames that disagree with each other, while still looking entirely plausible to the eye.
 
 ---
 
@@ -312,8 +319,21 @@ Integration to Home Assistant is possible with the ESPHome configuration include
 
 ## Possible future improvements
 
-* Shock Functionality: Capture the shock button signal and implement it as a separate function.
-* Protocol Reverse Engineering: Attempt to decode the underlying protocol to create a more robust and flexible implementation that can be easily adapted to different remotes without needing raw signal captures.
+### 1. Move transmission from the CPU to the RMT peripheral
+
+Today the waveform is bit-banged from the CPU with the FreeRTOS scheduler suspended, and every awkward constraint in this project descends from that one fact: frames must be contiguous, the CPU must be released periodically or the watchdog fires, and the release must be brief or the beep audibly chops. Three requirements, one knob.
+
+The ESP32-C3's **RMT** peripheral — Remote Control Transceiver, built for exactly this class of signal, and already used here to drive the WS2812 status LED — clocks a pulse train out of a buffer in hardware with no CPU involvement. That removes all three constraints at once: no `vTaskSuspendAll()`, no inter-burst gap, no watchdog exposure, and timing that Wi-Fi activity cannot perturb. It would also permit a genuinely continuous transmission for the full beep duration, exactly like holding the remote's button, which the present design cannot do at all.
+
+The frame fits neatly: an RMT symbol packs two level+duration entries, so 88 runs = **44 symbols** against a 48-symbol channel block. The open question is whether the C3 supports hardware TX looping, or whether continuous output needs a wrap-around refill interrupt.
+
+### 2. Capture the shock signal at several levels, and the B channel
+
+The protocol is **not decoded** — this is a verified replay. Decoding needs differential data rather than more of the same: frames that differ *only* in intensity localise the level field, and channel A versus B localises the channel field. A single frame in isolation is undecodable; a family of frames varying along known axes is not.
+
+That should expose the frame layout — where the remote's identity lives, where the command lives, and whether a checksum is present. It would turn this from a device that replays one captured remote into one that understands the protocol.
+
+⚠️ Capturing shock frames implies being able to transmit them. **The collar must not be worn by an animal during this work.** Beep-only remains the scope of the shipped firmware; this item is about understanding the protocol, not extending what the device does.
 
 ---
 

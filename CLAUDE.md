@@ -73,18 +73,28 @@ So the knobs are layered, and they are not independent:
 
 The historic 70% reliability was never a timing problem. It was burst structure, and the old payload only ever worked by accident.
 
-## TODO: move transmission to the RMT peripheral
+## TODO
 
-The gap exists solely because the waveform is bit-banged from the CPU with the scheduler suspended, which forces a three-way trade between contiguity, watchdog starvation, and audible chopping. The ESP32-C3's RMT peripheral clocks a pulse train out of a buffer in hardware with no CPU involvement, which removes all three constraints at once — no `vTaskSuspendAll()`, no gap, no watchdog exposure, and timing immune to Wi-Fi activity.
+### 1. Move transmission from the CPU to the RMT peripheral
 
-The frame fits: each RMT symbol holds two level+duration entries, so 88 runs = **44 symbols**, against a 48-symbol channel block on the C3. Open question is whether the C3 supports hardware TX looping or whether continuous output needs a wrap-around refill interrupt.
+The gap exists solely because the waveform is bit-banged from the CPU with the scheduler suspended, which forces a three-way trade between contiguity, watchdog starvation, and audible chopping. The ESP32-C3's RMT peripheral clocks a pulse train out of a buffer in hardware with no CPU involvement, which removes all three constraints at once — no `vTaskSuspendAll()`, no gap, no watchdog exposure, and timing immune to Wi-Fi activity. It would also allow a genuinely continuous transmission for the full beep duration, exactly like a button hold, which the current design cannot do at all.
+
+The frame fits: each RMT symbol holds two level+duration entries, so 88 runs = **44 symbols**, against a 48-symbol channel block on the C3. Open question is whether the C3 supports hardware TX looping or whether continuous output needs a wrap-around refill interrupt (ping-pong on the half-buffer threshold).
+
+### 2. Capture and analyse the shock signal, all levels, and the B channel
+
+Currently only the beep on channel A is captured, and the protocol is not decoded — this is a verified replay, not a decode. The next capture campaign should cover the **shock function at several intensity levels** and the **B channel**, because that is the differential data that makes a decode tractable: frames that differ only in the level field localise where intensity is encoded, and A vs B localises the channel field. One frame in isolation is undecodable; a family of frames that vary along known axes is not.
+
+Expect this to reveal the frame layout — where the remote's identity sits, where the command sits, and whether there is a checksum. Note the safety asymmetry: capturing shock frames means being able to *transmit* them, so the collar must not be on the dog during this work.
+
+Beep-only remains the scope of the shipped firmware. This item is about understanding the protocol, not extending the device's capability.
 
 ## RF constraints that look wrong but aren't
 
 - **Bit rate 100 kbps for a ~5 kBaud signal.** Deliberate 20x oversampling. In async mode the CC1101 samples GDO0 on its internal clock; at 5 kbps the PA gating jitters badly. Do not "fix" this to match the actual baud.
 - **`RX_BANDWIDTH` set on a TX-only device.** Selects a stable hardware filter tap off the 26 MHz crystal; keeps the RF bursts clean. Not dead config.
 - **Frequency is 869.525 MHz**, not 433 MHz. The CC1101 module must be the 868 MHz / 26 MHz-crystal variant.
-- **The symbol period is 208.875 µs, stored as 209** — not 200. Measured two independent ways against 13 presses at 2.000 MSps: rise-to-rise across the preamble (417.75 samples) and hand measurement at 50% crossings in URH. Every run in every capture quantises to this grid with zero off-grid elements. Do not trust URH's *Autodetect parameters* here — it reports 400 samples/symbol, wrong by 9%, because it fits a symbol length rather than measuring one.
+- **The symbol period is 208.647 µs, stored as 209** — not 200. Measured frame-start to frame-start: 272910 samples across exactly 654 ticks (417.294 samples/tick), with the six intermediate estimates agreeing to within 0.02%. Measure it this way rather than across the preamble or across the whole message — both endpoints are then rising edges at the same structural position, so rise-time bias cancels, and there is no ambiguity about whether the truncated final tick counts. Do not trust URH's *Autodetect parameters* here — it reports 400 samples/symbol, wrong by 9%, because it fits a symbol length rather than measuring one.
 - **`TRANSMIT_REPEAT` controls beep length.** The collar beeps as long as it keeps receiving; the repeat count is the duration knob, not a reliability-only retry. It counts **bursts**, not frames.
 
 ## Timing-critical section
