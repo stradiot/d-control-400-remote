@@ -129,7 +129,7 @@ These RF parameters were fine-tuned through SDR analysis and iterative testing t
 | Sync Word | Disabled | Bit-banging raw pulses; no hardware packet handling. |
 | Preamble/CRC | Disabled | Bypasses the CC1101 packet engine for "Asynchronous Mode." |
 | Transmission Mode| Asynchronous | Maps the physical state of GDO0 directly to the RF Power Amplifier (HIGH = RF ON, LOW = RF OFF). |
-| Pulse Timings | ~200/400 µs | Empirical: Derived from SDR Pulse Width Modulation (PWM) capture and verified by trial. |
+| Symbol Period | 208.875 µs (stored as 209) | Measured from SDR capture across 13 presses, not rounded. Every run length is 1 or 2 of these. See "Empirical Timing Analysis". |
 
 ---
 
@@ -144,20 +144,35 @@ While this project only transmits, setting the receiver bandwidth (`RxBandwidth`
 
 ### 3. FreeRTOS CPU Locking
 The ESP32 is a dual-core chip running a real-time OS (FreeRTOS) that handles background tasks. Background interrupts may distort the precise microsecond pulse timings required to fool the collar.
-* The Fix: The `vTaskSuspendAll()` function is used to lock the CPU for the entire duration of the signal transmission.
-* Watchdog Bypass: Because the entire sequence takes less than the standard 5-second Task Watchdog Timer (TWDT) limit, the sequence completes and resumes normal OS operations without triggering a panic reboot. If longer sequences are needed, the TWDT limit can be configured or it can be fed within the locked section.
+* The Fix: `vTaskSuspendAll()` locks the CPU for the duration of each **burst**.
+* Watchdog: the idle task, which normally feeds the Task Watchdog Timer, cannot run while the scheduler is suspended. On the ESPHome path this is not theoretical — a 159 ms burst followed by only a 5 ms gap reset the device with `ESP_RST_TASK_WDT`. The firmware therefore calls `App.feed_wdt()` in every inter-burst gap rather than relying on idle being scheduled: Wi-Fi and lwIP outrank idle and can consume the whole window.
 
-### 4. Repeated Transmission
-A single button press does not send the signal just once. The full `SIGNAL_BEEP` sequence is transmitted `TRANSMIT_REPEAT` (50) times in a row, with a `TRANSMIT_GAP_US` (5000 µs) Power-Amplifier-off gap between each repeat.
-* Beep duration: The collar beeps for as long as it keeps receiving the signal, so the repeat count directly controls how long the beep lasts. Increase `TRANSMIT_REPEAT` for a longer beep, decrease it for a shorter one.
-* Reliability: Repeating the burst also maximizes the chance that the collar's receiver cleanly captures at least one complete, correctly-timed sequence, and the gap gives it a clear idle period to detect the start of each new burst.
-* The entire loop runs inside the `vTaskSuspendAll()` locked section (see the FreeRTOS CPU Locking note above) and still completes well within the 5-second watchdog window.
+### 4. Burst Structure — Contiguity Matters More Than Anything Else
+This is the single most important property of the transmission, and the least obvious.
+
+**Frames within a burst are emitted back-to-back with no silence between them.** The original remote never inserts a gap mid-transmission: a tap is 7 contiguous frames (159.3 ms) and a 4.1 s hold is 180 contiguous frames, with no OFF period longer than 2 symbol periods anywhere inside either.
+
+This is not a detail. A firmware build that sent **one** frame followed by a 5 ms gap produced **zero** beeps, while an earlier, badly mistimed payload that happened to contain 2.5 frames per burst worked about 70% of the time. Two receiver behaviours explain it, and both demand contiguity:
+* **Consecutive-frame validation** — the decoder wants the next frame to arrive immediately and match before it acts, a standard guard against noise. A gap expires that timer on every frame.
+* **AGC settling** — a few milliseconds without carrier lets the receiver's automatic gain control drift toward the noise floor, corrupting the start of the next frame, which is exactly where the preamble lives.
+
+The three knobs are therefore layered and interdependent:
+
+| Macro | Meaning | Bounded by |
+| :--- | :--- | :--- |
+| `FRAMES_PER_BURST` | Contiguous frames, **no gap between them** | The collar's decoder. 7 matches a real tap and is known-good |
+| `TRANSMIT_GAP_US` | Silence **between bursts only** | Audibility: 5 ms is inaudible, 30 ms audibly chops the beep |
+| `TRANSMIT_REPEAT` | Number of bursts, i.e. beep duration | The watchdog budget |
+
+Raising `FRAMES_PER_BURST` means feeding the watchdog more often, or the device resets.
 
 ### 5. Empirical Timing Analysis
-The 200 µs and 400 µs pulse durations are not based on official documentation. Instead, they were derived through:
-* SDR Capture Analysis: Identifying the Pulse Width Modulation (PWM) duty cycle in a raw Amplitude Modulated (AM) signal capture.
-* Heuristic Refinement: Manually "cleaning" the captured timings to the nearest 50-100 µs intervals to remove capture noise.
-* Verification: Iteratively testing the "guessed" timings against the physical hardware until a most reliable trigger was found.
+The symbol period is **208.875 µs**, stored as `209`. It was measured, not guessed, from three RTL-SDR captures at 2.000 MSps covering 13 button presses:
+* **Rise-to-rise across the preamble** — 417.75 samples per period, steady to ±0.5.
+* **Hand measurement in URH** at 50% crossings on both edges. Measuring edge-to-edge instead biases high by the rise and fall time; taking both at the 50% crossing cancels it.
+* **Verification**: every run in every capture quantises onto that grid, with zero off-grid elements.
+
+An earlier version of this project used 200 µs, which is 4.5% fast. Note the trap: URH's *Autodetect parameters* reports 400 samples/symbol here, wrong by 9%, because it fits a symbol length rather than measuring one. Hand measurement caught it.
 
 ---
 
@@ -167,9 +182,11 @@ For security and safety reasons, the actual payload timings for my personal dog 
 
 To use this project, the RF signal for the specific remote to be cloned has to be captured using an SDR (Software Defined Radio) set to AM/ASK mode. The captured microsecond timings then have to be injected into the code.
 
+The payload is stored as **run lengths in symbol periods**, not absolute microseconds. Every element is a whole number of `BASE_TICK_US` ticks, so the entire frame is parameterised by a single number — which is what makes the calibration sweep below possible.
+
 1. Locate the file `include/signal.h` in the repository.
 2. Copy-paste the macro below into the file, overwriting its current contents.
-3. Replace the dummy signal data with your captured timings (positive numbers for HIGH/RF ON, negative numbers for LOW/Silence).
+3. Replace the dummy run lengths with your captured signal (positive numbers for HIGH/RF ON, negative for LOW/Silence), expressed as multiples of the symbol period.
 
 ```cpp
 #pragma once
@@ -178,16 +195,28 @@ To use this project, the RF signal for the specific remote to be cloned has to b
 #define OUTPUT_POWER 10           // CC1101 transmit power in dBm
 #define BIT_RATE 100.0            // Async oversampling rate in kbps
 #define RX_BANDWIDTH 116.0        // Receiver filter bandwidth in kHz
-#define TRANSMIT_REPEAT 50        // Times the full sequence is re-sent per trigger (also sets beep duration)
-#define TRANSMIT_GAP_US 5000      // PA-off gap in microseconds between each repeat
+#define FRAMES_PER_BURST 7        // Contiguous frames per burst, with NO gap between them
+#define TRANSMIT_REPEAT 18        // Bursts per trigger (also sets beep duration)
+#define TRANSMIT_GAP_US 5000      // PA-off gap between BURSTS only, never between frames
 
-// Replace the numbers below with your SDR captured timings in microseconds.
-#define SIGNAL_BEEP { \
-  200, -200, 400, -400, 200, -200, ... \
+#define BASE_TICK_US 209          // Symbol period; every run length is a multiple of this
+
+// Replace the numbers below with your captured run lengths, in BASE_TICK_US units.
+// Absolute duration of element i is BASE_TICK_US * abs(SIGNAL_BEEP_TICKS[i]).
+#define SIGNAL_BEEP_TICKS { \
+  1, -1, 2, -2, 1, -1, ... \
 }
 ```
 
-> **Note:** Keep the `TRANSMIT_REPEAT` and `TRANSMIT_GAP_US` macros — they are required by `src/main.cpp` and the code will not compile without them. See the "Repeated Transmission" note under Technical Specifics for what they do.
+> **Note:** Keep all of the macros above — both firmware paths require them and the code will not compile without them. See "Burst Structure" under Technical Specifics for what `FRAMES_PER_BURST`, `TRANSMIT_REPEAT` and `TRANSMIT_GAP_US` do, and why the difference between "between frames" and "between bursts" is the difference between working and not working at all.
+
+### Calibrating the symbol period
+
+`BASE_TICK_US` matters, and a capture rounded to a convenient value will be wrong. The error is not benign: it accumulates across the frame, so a small per-tick offset becomes a large phase error by the end. A 109-tick frame sent at 200 µs when the true period is 209 µs drifts by ~1 ms — around five symbols — and a receiver with bit-sync loses lock partway through.
+
+Measure it rather than guessing, and prefer a direct measurement to a sweep: take the rise-to-rise distance across *N* preamble periods and divide by *N*, which averages out edge noise. Then use the serial `k` command to confirm the measured value beats its neighbours, rather than to discover it.
+
+Be aware, though, that a wrong tick produces *intermittent* triggering, whereas a wrong **burst structure** produces *no* triggering at all. If the collar never responds, check `FRAMES_PER_BURST` and the placement of `TRANSMIT_GAP_US` before you touch the timebase — that failure mode is not a calibration problem and no amount of sweeping will find it.
 
 ---
 
@@ -215,6 +244,29 @@ The onboard RGB LED reports the device state:
 ## 🎮 Usage
 1. Power up the board and ensure the LED flashes Green, indicating successful CC1101 initialization
 2. Press the BOOT button to transmit the signal. The LED will turn Blue during transmission and then turn off once complete.
+
+---
+
+## 🎛️ Serial Calibration Mode
+
+Tuning the signal by editing `signal.h` and reflashing costs a couple of minutes per trial, which makes a proper parameter sweep impractical. The firmware therefore exposes the RF parameters over the serial monitor (115200 baud) so they can be changed at runtime. Nothing is persisted — a reset restores the values compiled in from `signal.h`.
+
+| Command | Effect |
+| :--- | :--- |
+| `k <us>` | Symbol period (`BASE_TICK_US`) — the primary calibration parameter |
+| `p <dBm>` | Output power |
+| `r <n>` | Repeat count |
+| `g <us>` | Inter-frame gap |
+| `f <MHz>` | Carrier frequency |
+| `m <0\|1>` | Timing engine: `0` legacy, `1` absolute-deadline scheduling + synthesiser settle |
+| `t` | Transmit one burst |
+| `?` | Print current state |
+
+**Finding the symbol period.** Fix the collar at a marked distance, then sweep `k` across a range around the nominal value, firing ~20 bursts with `t` at each step and recording how many trigger the beep. Plot success rate against `k`. A distinct peak away from the nominal value means the captured timings were rounded, and the peak is your real symbol period. A flat, uniformly mediocre curve means the problem is the frame *structure* rather than its timebase, and a fresh SDR capture is needed.
+
+**Timing engine A/B.** `m 0` reproduces the original bit-banging loop exactly, including its per-edge behaviour; `m 1` schedules every edge against a fixed timebase so that per-edge overhead stops accumulating across the frame, and adds a short synthesiser settle before the first pulse. Comparing success rates between the two modes at the same `k` measures how much the timing engine was actually costing.
+
+> **Safety:** the transmit burst runs with the FreeRTOS scheduler suspended, so it must complete well inside the task watchdog window. Any `k`, `r`, or `g` change that would push the burst past ~4 seconds is rejected with an error rather than accepted, and the previous value is kept.
 
 ---
 
