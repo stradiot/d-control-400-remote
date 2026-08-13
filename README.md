@@ -241,16 +241,26 @@ This project is built using PlatformIO. The RadioLib library is used for CC1101 
 ## 🚥 Status Indication
 The onboard RGB LED reports the device state:
 
-* 🟢 **Solid Green (0.5s):** Power on / CC1101 Radio initialized successfully.
-* 🔴 **Solid Red:** Radio initialization failed (Check your SPI wiring).
-* 🔵 **Solid Blue:** Actively transmitting the RF signal (CPU locked).
-* ⚫ **LED Off:** Standby mode / Ready for input.
+* 🟢 **Green (0.5 s), once at boot:** CC1101 radio initialized successfully.
+* 🟢 **Green pulse (80 ms) every 5 s:** Liveness heartbeat — the device is powered, running and the radio is OK.
+* 🟠 **Amber pulse (80 ms) every 5 s** *(ESPHome path only)*: alive and radio OK, but **Wi-Fi is down** — the device cannot be reached from Home Assistant or `esphome logs`.
+* 🔴 **Solid Red, never pulsing:** Radio initialization failed (check your SPI wiring).
+* 🔵 **Solid Blue:** Actively transmitting the RF signal (CPU locked). The heartbeat is suppressed for the duration.
+* ⚫ **LED Off:** No power, or the device has crashed.
+
+The heartbeat exists so that idle is distinguishable from dead. It is also why
+the colour encodes the Wi-Fi state: a device with a dropped Wi-Fi link is alive
+and transmits fine, but is invisible to every other diagnostic channel, so the
+LED is the only place that failure can be observed. Because the heartbeat is
+gated on the radio being ready, a board that sits solid red and never pulses has
+exactly one problem.
 
 ---
 
 ## 🎮 Usage
 1. Power up the board and ensure the LED flashes Green, indicating successful CC1101 initialization
-2. Press the BOOT button to transmit the signal. The LED will turn Blue during transmission and then turn off once complete.
+2. Confirm the green heartbeat pulse appears every 5 seconds — that is the device reporting it is alive and idle.
+3. Press the BOOT button to transmit the signal. The LED will turn Blue during transmission, then return to the idle heartbeat once complete.
 
 ---
 

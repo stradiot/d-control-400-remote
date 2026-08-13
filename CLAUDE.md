@@ -115,8 +115,27 @@ Wi-Fi `output_power: 8.5dBm` in the YAML is a hardware fix for LDO brownout on t
 
 ## LED status convention
 
-Standalone: green 0.5 s = radio OK · solid red = init failed (halts) · blue = transmitting · off = idle.
-ESPHome: red = booting or init failed · green flash = Wi-Fi + radio ready · blue = transmitting.
+Standalone: green 0.5 s at boot = radio OK · **green pulse 80 ms / 5 s = alive heartbeat** · solid red = init failed (halts) · blue = transmitting · off = no power or crashed.
+ESPHome: red = booting or init failed · green flash = Wi-Fi + radio ready · **green pulse 80 ms / 5 s = alive, Wi-Fi up** · **amber pulse 80 ms / 5 s = alive, Wi-Fi down** · blue = transmitting.
+
+The heartbeat is what makes idle distinguishable from dead, and it is gated on
+`is_ready()` so a board that sits solid red and never pulses has exactly one
+problem (radio init) rather than two.
+
+Two things about it are load-bearing, not decoration:
+
+- **The ESPHome colour encodes Wi-Fi state because nothing else can.** A device
+  with a dropped Wi-Fi link is alive and transmits fine but is invisible to Home
+  Assistant *and* to `esphome logs`, so the LED is the only witness. A plain
+  green pulse there would be a false all-clear in the one failure mode where you
+  walk over and look at the board.
+- **The ESPHome heartbeat guards `light.turn_off` as well as the pulse start.**
+  It is an async automation, so a trigger arriving mid-pulse sets the LED blue
+  and an unconditional `turn_off` would then blank it for the whole ~3 s
+  transmission. Both ends need the `script.is_running: transmit_beep` check.
+  `src/main.cpp` needs no such guard: `triggerTransmit()` blocks `loop()`, so the
+  heartbeat and the timing-critical section are mutually exclusive by
+  construction and `strip.show()` can never land inside `transmitSequence()`.
 
 ## Scope
 

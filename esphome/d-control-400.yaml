@@ -102,6 +102,59 @@ light:
     default_transition_length: 0s
     internal: true
 
+# Liveness heartbeat. An idle device was previously dark, which is
+# indistinguishable from one that is dead or unpowered.
+#
+# The colour carries the Wi-Fi state, and that is the point rather than a
+# flourish: a device whose Wi-Fi has dropped is alive and transmitting fine but
+# completely invisible -- no Home Assistant entity, no `esphome logs`. The LED is
+# the only witness to that failure, so a plain green pulse there would be a false
+# all-clear. Amber says "alive, radio OK, but you cannot reach me".
+#
+# Gating on is_ready() also sharpens the solid-red state: red used to mean
+# "booting OR radio init failed", and now a board that sits red and never pulses
+# has exactly one problem.
+interval:
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            and:
+              # Radio init failed -> leave the solid red alone.
+              - lambda: 'return cc1101_ctrl::is_ready();'
+              # Never fight the blue transmit indication.
+              - not:
+                  script.is_running: transmit_beep
+          then:
+            - if:
+                condition: wifi.connected
+                then:
+                  - light.turn_on:
+                      id: status_led
+                      brightness: 15%
+                      red: 0.0
+                      green: 1.0
+                      blue: 0.0
+                else:
+                  - light.turn_on:
+                      id: status_led
+                      brightness: 15%
+                      red: 1.0
+                      green: 0.35
+                      blue: 0.0
+            # Short and dim: this repeats forever, unlike the one-off boot flash.
+            - delay: 80ms
+            # Re-check before clearing. A trigger that arrived during the pulse has
+            # already set the LED blue, and an unconditional turn_off here would
+            # blank it for the whole ~3 s transmission. Guarding only the start of
+            # the pulse does not close this window.
+            - if:
+                condition:
+                  not:
+                    script.is_running: transmit_beep
+                then:
+                  - light.turn_off: status_led
+
 script:
   # Why the chip last reset. The ROM prints this on UART0 at boot, but those
   # messages never reach the network log, so re-emit it as a normal log line.

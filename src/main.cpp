@@ -48,6 +48,18 @@ volatile bool buttonTriggered = false;
 unsigned long lastDebounceTime = 0;
 constexpr unsigned long debounceDelay = 200;
 
+// --- Liveness heartbeat ---
+// An idle device used to be dark, which is indistinguishable from one that is
+// dead or unpowered. A brief green pulse every HEARTBEAT_PERIOD_MS makes "alive
+// and radio OK" visible at a glance. Short and dim on purpose: this repeats
+// forever, so it must not be a nuisance in a room.
+// Green is scaled by strip.setBrightness(LED_BRIGHTNESS) on top of this value.
+constexpr unsigned long HEARTBEAT_PERIOD_MS = 5000;
+constexpr unsigned long HEARTBEAT_ON_MS = 80;
+constexpr uint8_t HEARTBEAT_GREEN = 120;
+unsigned long lastHeartbeatMs = 0;
+bool heartbeatLit = false;
+
 // --- Serial command buffer ---
 char cmdBuf[32];
 uint8_t cmdLen = 0;
@@ -62,6 +74,33 @@ void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
 void clearLED() {
     strip.clear();
     strip.show();
+}
+
+// Non-blocking two-state pulse driven from loop(). Deliberately not a delay():
+// loop() has to stay responsive to the button flag and to serial commands.
+//
+// This cannot collide with the transmission the way the ESPHome path can.
+// triggerTransmit() blocks loop() for the whole sequence, so the heartbeat and
+// the timing-critical section are mutually exclusive by construction -- there is
+// no window in which strip.show() (which briefly masks interrupts) could land
+// inside transmitSequence().
+//
+// Period is measured pulse-start to pulse-start; lastHeartbeatMs is only
+// advanced when the LED lights. Unsigned arithmetic makes it millis()-rollover
+// safe, same as the debounce above.
+void pollHeartbeat() {
+    unsigned long now = millis();
+
+    if (!heartbeatLit) {
+        if (now - lastHeartbeatMs >= HEARTBEAT_PERIOD_MS) {
+            setLEDColor(0, HEARTBEAT_GREEN, 0);
+            heartbeatLit = true;
+            lastHeartbeatMs = now;
+        }
+    } else if (now - lastHeartbeatMs >= HEARTBEAT_ON_MS) {
+        clearLED();
+        heartbeatLit = false;
+    }
 }
 
 // --- Interrupt Service Routine ---
@@ -404,7 +443,15 @@ void loop() {
 
         triggerTransmit();
 
+        // Restart the heartbeat cycle rather than letting a pulse fire the instant
+        // the beep ends: the sequence outlasts HEARTBEAT_PERIOD_MS, so the timer
+        // is always overdue by the time triggerTransmit() returns.
+        heartbeatLit = false;
+        lastHeartbeatMs = millis();
+
         buttonTriggered = false; // Reset the flag
         Serial.println(F("Done. Waiting for next press."));
     }
+
+    pollHeartbeat();
 }
