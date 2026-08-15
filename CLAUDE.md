@@ -21,7 +21,7 @@ Both include the shared headers `include/pinout.h` and `include/signal.h`. See `
 
 Behavioural differences that are intentional, not drift:
 - `src/main.cpp` holds `vTaskSuspendAll()` across **all** `TRANSMIT_REPEAT` bursts; `esphome/cc1101.h` suspends/resumes **per burst** so ESPHome can service Wi-Fi in the gaps. Neither suspends per *frame* — see "Burst contiguity" below.
-- `cc1101.h` calls `esphome::App.feed_wdt()` in every inter-burst gap. `main.cpp` has no equivalent and relies on the whole sequence fitting inside `WATCHDOG_BUDGET_US`.
+- `cc1101.h` calls `esphome::App.feed_wdt()` in every inter-burst gap. `main.cpp` has no equivalent and does not need one — see "The two paths have different watchdog exposure" below.
 - `main.cpp` keeps a `timingMode` switch (legacy per-edge vs absolute-deadline); `cc1101.h` only implements the deadline engine.
 - `main.cpp` passes `CC1101_GDO0` as RadioLib's GPIO arg; `cc1101.h` passes `RADIOLIB_NC` and drives the pin manually.
 
@@ -54,7 +54,18 @@ There are no tests. `test/`, `lib/`, and `include/README` are empty PlatformIO s
 
 This encoding is deliberate: the payload's elements are all ±1 or ±2, so the entire 88-element frame is parameterised by the single scalar `BASE_TICK_US`. That is what makes the symbol-period sweep (serial `k` command) possible without a re-capture. Do not "simplify" this back to absolute microseconds — it would destroy the ability to calibrate.
 
-Re-encrypt with `sops -e -i include/signal.h` before committing. Never commit a decrypted `signal.h`.
+The age private key lives at SOPS's default key location, so `sops -d -i include/signal.h` works with no env var and no flag. **The path is platform-dependent** — SOPS resolves it via Go's `os.UserConfigDir()`:
+
+- **macOS:** `~/Library/Application Support/sops/age/keys.txt`
+- **Linux:** `~/.config/sops/age/keys.txt`
+
+Using the Linux path on macOS fails with `identity did not match any of the recipients`, which is misleading: the key was never loaded, not mismatched. SOPS's error lists only the `SOPS_AGE_*` env vars it checked and never names the default path, so it reads like a wrong key when it means no key.
+
+Verify with `age-keygen -y <path>` — that prints the *public* key, which must equal the recipient in `.sops.yaml`. Matching it proves decryption will work without touching the real file, and without putting the private key on screen.
+
+Re-encrypt with `sops -e -i include/signal.h` before committing. Never commit a decrypted `signal.h`. If the plaintext was only read and not edited, restore a pre-decrypt snapshot instead — `sops -e -i` rolls a fresh data key and MAC, so it diffs against HEAD even for identical content.
+
+Decrypt from the repo root and do not `cd` afterwards. A cleanup step holding a *relative* path stops protecting anything the moment the shell changes directory — that is how a decrypted `signal.h` was once left in the working tree.
 
 `esphome/secrets.yaml` (Wi-Fi creds + `api_encryption_key`) is gitignored and must be created locally.
 
@@ -104,6 +115,30 @@ The transmit loop runs with the FreeRTOS scheduler suspended, for a whole burst 
 **The task watchdog is a live constraint, not a theoretical one.** The idle task cannot run under `vTaskSuspendAll()`, and on the ESPHome path a 159 ms burst followed by only a 5 ms gap reset the device with `ESP_RST_TASK_WDT` (confirmed 2026-08-11). The fix that worked was calling `esphome::App.feed_wdt()` in each gap — Wi-Fi and lwIP sit far above idle in priority and can consume the entire window servicing the backlog that accumulated during the burst, so relying on idle being scheduled is not safe. Lengthening the gap also works but is not free: it chops the beep audibly.
 
 If `FRAMES_PER_BURST` or `TRANSMIT_REPEAT` grow substantially, feed the TWDT more often or raise its limit rather than letting it panic-reboot. `d-control-400.yaml` logs `esp_reset_reason()` on boot and on every API client connect, which is how the watchdog was distinguished from a brownout — the two look identical from the outside and have opposite fixes.
+
+### The two paths have different watchdog exposure
+
+The standalone build cannot trip the task watchdog at all, which is why it can
+hold `vTaskSuspendAll()` across the *whole* ~2.96 s sequence where the ESPHome
+path must release it every burst. In
+`~/.platformio/packages/framework-arduinoespressif32-libs/esp32c3/sdkconfig` the
+TWDT is enabled and set to panic at 5 s, but
+`# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set` — **the idle task is
+never subscribed**. Nothing feeds that watchdog and nothing trips it. The exact
+mechanism that reset the ESPHome device (idle can't run while suspended, idle
+feeds the TWDT, so the TWDT starves) has no counterpart here.
+
+So `WATCHDOG_BUDGET_US` in `main.cpp` is defensive, not load-bearing. Keep it —
+it costs nothing and it stops a calibration command from setting up a
+multi-second blocking transmit — but do not read a passing budget check as the
+reason the standalone path survives.
+
+The interrupt watchdog is not a concern on either path despite its 300 ms
+timeout being shorter than a 159 ms burst plus overhead:
+`vTaskSuspendAll()` defers context switches but does **not** disable
+interrupts, so the FreeRTOS tick ISR keeps running. `micros()` keeps working
+across a suspend for the same class of reason — it reads the systimer, not the
+FreeRTOS tick count.
 
 In `esphome/cc1101.h`, the `#undef`/`#define` block that routes `delay`/`delayMicroseconds`/`millis`/`micros`/`yield` through `esphome::` must stay at the top of the file, before the RadioLib include, or the Arduino SDK macros win and timing breaks.
 

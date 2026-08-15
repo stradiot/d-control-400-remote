@@ -187,6 +187,19 @@ An earlier measurement across 42 preamble ticks gave 417.75, which is 0.11% high
 
 For security and safety reasons, the actual payload timings for my personal dog collar are stored encrypted (via [SOPS](https://github.com/getsops/sops) + age). This means the `include/signal.h` file shipped in a fresh clone contains encrypted ciphertext, **not** valid C code — the project will not compile until you replace it with your own captured signal as described below.
 
+If you hold the age private key (i.e. you are me), put it at SOPS's default key location so that `sops -d -i include/signal.h` works with no environment variable and no flag. **That path is platform-dependent**, because SOPS resolves it with Go's `os.UserConfigDir()`:
+
+| Platform | Default key path |
+| :--- | :--- |
+| macOS | `~/Library/Application Support/sops/age/keys.txt` |
+| Linux | `~/.config/sops/age/keys.txt` |
+
+Using the Linux path on macOS fails with `identity did not match any of the recipients` — a misleading message, since the error is that SOPS never loaded the file at all. Its diagnostic lists only the `SOPS_AGE_*` environment variables it checked and never names the default path it looked at, so it reads like "wrong key" when it means "no key here".
+
+Confirm the right key is installed with `age-keygen -y <path>`, which prints the *public* key and must match the recipient in `.sops.yaml`. That verifies decryption will work without touching the encrypted file and without putting the private key on screen.
+
+Re-encrypt with `sops -e -i include/signal.h` before committing; a decrypted `signal.h` must never be committed. If the plaintext was only read and not modified, restoring a pre-decrypt copy is preferable — `sops -e -i` generates a fresh data key and MAC, so it produces a diff even when the content is identical.
+
 To use this project, the RF signal for the specific remote to be cloned has to be captured using an SDR (Software Defined Radio) set to AM/ASK mode. The captured microsecond timings then have to be injected into the code.
 
 The payload is stored as **run lengths in symbol periods**, not absolute microseconds. Every element is a whole number of `BASE_TICK_US` ticks, so the entire frame is parameterised by a single number — which is what makes the calibration sweep below possible.
