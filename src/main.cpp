@@ -33,7 +33,17 @@ float carrierMHz = CARRIER_FREQUENCY;
 //                  restart, no synthesiser settle). This is the baseline to measure against.
 //   1 = deadline : absolute-deadline scheduling so digitalWrite() overhead stops
 //                  integrating across the frame, plus a synthesiser settle delay.
-uint8_t timingMode = 0;
+//
+// Defaults to 1 because that is what the ESPHome path implements and what has been
+// validated against the collar in daily use; having the two paths differ in an
+// unexamined way is not worth the risk.
+//
+// Measured 2026-08-15, first hardware run of this firmware: 6/6 clean on mode 0 and
+// 5/6 clean on mode 1, i.e. statistically indistinguishable (Fisher p = 1.0) -- do
+// NOT read that as mode 0 winning. The geometry was short-range and unobstructed,
+// where there is enough RF margin that mode 0's stretched symbols still decode, so
+// the test could not exercise the difference. Mode 0 is kept as the A/B baseline.
+uint8_t timingMode = 1;
 
 // Sum of all run lengths in ticks; used for the watchdog budget check.
 uint32_t tickSum = 0;
@@ -140,6 +150,18 @@ void transmitSequence() {
     for (uint16_t repeat = 0; repeat < repeatCount; repeat++) {
         // Ensure PA is OFF during the inter-burst gap. Nothing separates the frames
         // inside a burst -- that contiguity is what the collar's decoder needs.
+        //
+        // Note this gap sits INSIDE the vTaskSuspendAll() region, so unlike the
+        // ESPHome path it yields to nothing -- no scheduler, no idle task, no Wi-Fi.
+        // It is pure RF-side silence and buys this path no scheduling headroom at
+        // all. `g 0` was tested on hardware 2026-08-15 (6/6 clean, 126 contiguous
+        // frames over ~2.87 s) and the collar decoded it fine, which matches the
+        // capture: a real 4.14 s hold is 180 contiguous frames with no gap.
+        //
+        // gapUs is still seeded from TRANSMIT_GAP_US, which must stay non-zero
+        // because signal.h is shared with the ESPHome path, where the gap is outside
+        // the suspend and is where feed_wdt() runs. Zeroing it there reboots the
+        // device on the task watchdog.
         digitalWrite(CC1101_GDO0, LOW);
         delayMicroseconds(gapUs);
 
