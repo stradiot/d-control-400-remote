@@ -1,3 +1,5 @@
 creation_rules:
+  - path_regex: signal_captures.txt
+    age: 'age1k0c647skc7ws8hp6mnkktdmxvekftwynm2p4xt4hkrg66xxxg96qqpthnp'
   - path_regex: include/signal.h
     age: 'age1k0c647skc7ws8hp6mnkktdmxvekftwynm2p4xt4hkrg66xxxg96qqpthnp'

@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Firmware for a Wemos LOLIN C3 Mini (ESP32-C3) + CC1101 868 MHz transceiver that replays a captured RF signal to trigger the beep function of a Dogtrace d-control 400 dog collar. The protocol is **not** decoded — this is a raw OOK pulse-train replay, bit-banged onto the CC1101's GDO0 pin in asynchronous direct mode. There is no packet engine, no sync word, no CRC.
+Firmware for a Wemos LOLIN C3 Mini (ESP32-C3) + CC1101 868 MHz transceiver that replays a captured RF signal to trigger the beep function of a Dogtrace d-control 400 dog collar. Transmission is a raw OOK pulse-train replay, bit-banged onto the CC1101's GDO0 pin in asynchronous direct mode — no packet engine, no sync word, no CRC.
+
+The frame **is** now structurally decoded (2026-09-06, see "Frame structure" below), but nothing in the transmit path uses that. The firmware still emits a stored payload verbatim. The decode is analysis; it changed no code.
 
 Repo also carries hardware artifacts: `pcb/gerber.zip` (fab-ready), `enclosure/` (Fusion 360 + STL/3MF), `doc/` (media). Those are binary deliverables, not build inputs.
 
@@ -48,6 +50,8 @@ There are no tests. `test/`, `lib/`, and `include/README` are empty PlatformIO s
 
 `include/signal.h` is **SOPS + age encrypted** (see `.sops.yaml`) — the checked-in file is JSON ciphertext, not C. Building requires either decrypting it (`sops -d include/signal.h`) with the age key, or replacing it with your own captured signal using the template in the README's "Adding Custom Signal" section. `include/pinout.h` is plaintext and committed as-is.
 
+`signal_captures.txt` is encrypted under the same `.sops.yaml` rules and to the same age recipient. It is the decoded frame worksheet, not a build input — nothing includes it.
+
 `signal.h` must define: `CARRIER_FREQUENCY`, `OUTPUT_POWER`, `BIT_RATE`, `RX_BANDWIDTH`, `FRAMES_PER_BURST`, `TRANSMIT_REPEAT`, `TRANSMIT_GAP_US`, `BASE_TICK_US`, and `SIGNAL_BEEP_TICKS`. All are used by both paths.
 
 `SIGNAL_BEEP_TICKS` is a brace-enclosed initializer of signed **run lengths in `BASE_TICK_US` units** — not absolute microseconds. **Positive = RF ON (GDO0 HIGH), negative = RF OFF**; absolute duration of element `i` is `BASE_TICK_US * abs(ticks[i])`. Both firmware paths consume it as `constexpr int32_t[]` and derive length via `sizeof`.
@@ -67,7 +71,128 @@ Re-encrypt with `sops -e -i include/signal.h` before committing. Never commit a 
 
 Decrypt from the repo root and do not `cd` afterwards. A cleanup step holding a *relative* path stops protecting anything the moment the shell changes directory — that is how a decrypted `signal.h` was once left in the working tree.
 
+### The pre-commit guard
+
+`.githooks/pre-commit` refuses any commit that stages `include/signal.h` or
+`signal_captures.txt` in plaintext, and warns (without blocking) when either is
+sitting decrypted in the working tree. It checks the **staged blob**, not the file
+on disk — a decrypted working copy with ciphertext staged is fine, and the reverse
+is the accident being guarded against. Detection is a text test for sops's `"sops"`
+key and `ENC[AES256_GCM` envelope, so it needs no age key and works on a machine
+that cannot decrypt.
+
+Enable it in a fresh clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+**A local `core.hooksPath` replaces the global one rather than adding to it.** This
+machine sets a global `core.hooksPath` in `~/.gitconfig` for a `prepare-commit-msg`
+generator, which would silently stop running here. That is why
+`.githooks/prepare-commit-msg` exists: it resolves the global hooks directory at run
+time and execs its hook if there is one.
+
+**Its re-entry guard is load-bearing and must not be removed.** A global hook may
+chain the other way, into the repo's local hook, resolving it with `git rev-parse
+--git-path hooks/prepare-commit-msg` — and that honours `core.hooksPath`, so it
+resolves to the shim. Shim execs global, global calls local, local execs global. A
+global hook's own "don't call myself" check compares against `$0` and cannot see a
+two-hop cycle. Unguarded, this forks until the process table fills; it did, at
+roughly 3000 processes in two minutes, before the guard existed. The
+`GIT_HOOK_CHAIN_DCONTROL400` variable breaks the cycle on second entry and lets the
+global hook proceed.
+
+If you add another hook here, it needs the same shim and the same guard, or the
+global copy stops firing.
+
 `esphome/secrets.yaml` (Wi-Fi creds + `api_encryption_key`) is gitignored and must be created locally.
+
+## Frame structure
+
+Decoded 2026-09-06 from a differential campaign — beep and shock, channels A and
+B, all 20 shock levels, 42 distinct frames pulled from raw IQ and cross-checked
+against hand-cut URH transcriptions.
+
+Every frame is **88 runs** of 1T or 2T, T = 208.647 µs, **run-length coded**. The
+levels carry no information whatsoever: two adjacent runs at the same level would
+merge into one, so the level sequence is fully determined by the first one and
+everything is in the durations. That rules out NRZ, Manchester, PWM and PPM
+outright, and `ticks = 88 + (number of 2T runs)` is an identity on every frame
+measured.
+
+Canonical cut: the 88 runs beginning at the **last 31 unit runs before a double**.
+Do not anchor on the start of the visible alternating stretch at a frame boundary
+— that is the preamble plus however many short runs trail the *previous* frame, so
+its length is data-dependent.
+
+Of the 88 runs, **68 are constant** across everything this handset transmits: both
+functions, both channels, all 20 levels. The other 20 are the entire command
+surface. `A` = short run, `B` = long run:
+
+```
+run     field
+0-30    preamble          31 short runs
+31-44   constant          handset-specific
+45-46   channel           AB = channel A,  BA = channel B
+47-66   constant          handset-specific
+67-68   function          AB = beep,       BA = shock
+69-70   constant          handset-specific
+71-78   level             8 runs, MSB first, long = 1
+79-86   redundancy        run 79+i against run 71+i:
+                            i = 0..3   always complement
+                            i = 4,5    complement = shock, copy = beep
+                            i = 6,7    (complement, copy) = channel A
+                                       (copy, complement) = channel B
+87      constant          always short
+```
+
+The redundancy block is the part worth knowing about, and it is not a checksum. It
+is the level field re-emitted through a mask: half its positions always complement
+the original, and the rest complement or copy depending on the channel and the
+function. So each command field is stated twice — once outright, once as a
+perturbation of the redundancy — and a receiver validating the two halves against
+each other reads the command out of the comparison itself.
+
+Neither the channel nor the function field ever takes `AA` or `BB`. Two readings
+fit and 42 frames cannot separate them, since each field has only two observations:
+two-bit fields with two spare states (room for two more functions and two more
+channels), or one-bit fields in a balanced 1-of-2 code where `AA`/`BB` are invalid.
+A higher model in the d-control range, which has more channels, would settle it.
+
+The level-to-value map is monotone, strongly non-linear, and has no formula behind
+it. It lives in the **remote** — the handset decides what value to send — so the
+collar holds a separate value-to-output map. A formula may exist if the value is a
+physical quantity such as a pulse width; testing that means instrumenting the
+collar, not capturing more RF.
+
+**What stays encrypted in `signal_captures.txt`:** the 68 constant runs and the
+level-to-value table. The schema above is protocol structure, discoverable by
+anyone with this model and an SDR. The constants are one handset's identity and are
+the only thing that makes a frame *this* remote's.
+
+Three things the captures cannot settle, in descending order of what they buy:
+
+- **Are those 68 constant runs a per-handset identifier?** They are constant under
+  every axis a single handset can vary, which is a weaker claim than "identifier".
+  This is the assumption the Scope section has always rested on and it has never been
+  tested. **It needs a second remote** — no capture of this one can settle it. The
+  diff splits the block into what differs (identity) and what agrees (framing), with
+  the confounder that two handsets may also differ by firmware revision, since remote
+  and collar ship as a pair. A third handset disambiguates; so does the shape, an
+  identifier being likely contiguous and a revision counter likely separate and small.
+- **Is there a formula behind the level-to-value map?** Monotone, strongly
+  non-linear, nothing recovered from the numbers alone. The map lives in the remote,
+  so the collar holds a separate value-to-output map. If the transmitted value is a
+  physical quantity — pulse width being plausible for a switched source — the table is
+  samples of a curve. Testing it means instrumenting the collar's output, so it needs a
+  scope and the hardware already here rather than a second remote: the cheapest of the
+  three. The collar must not be on the dog during that work.
+- **Is the two-collar limit real?** *Highly optional.* Nothing in the frame enforces
+  it — the channel is just two more address runs, so pairing two collars to one
+  channel should make both fire. Tests the system rather than the protocol, and
+  nothing depends on the answer. Recorded as a clean prediction, not as work worth
+  buying hardware for.
 
 ## Burst contiguity — the rule that actually decides whether it works
 
@@ -92,13 +217,16 @@ The gap exists solely because the waveform is bit-banged from the CPU with the s
 
 The frame fits: each RMT symbol holds two level+duration entries, so 88 runs = **44 symbols**, against a 48-symbol channel block on the C3. Open question is whether the C3 supports hardware TX looping or whether continuous output needs a wrap-around refill interrupt (ping-pong on the half-buffer threshold).
 
-### 2. Capture and analyse the shock signal, all levels, and the B channel
+### 2. Decode the protocol — done 2026-09-06
 
-Currently only the beep on channel A is captured, and the protocol is not decoded — this is a verified replay, not a decode. The next capture campaign should cover the **shock function at several intensity levels** and the **B channel**, because that is the differential data that makes a decode tractable: frames that differ only in the level field localise where intensity is encoded, and A vs B localises the channel field. One frame in isolation is undecodable; a family of frames that vary along known axes is not.
+Closed. The differential campaign covered beep and shock across channels A and B
+and all 20 shock levels; the layout is in "Frame structure" above. What is left is
+not more capture of this handset — it is the two hardware questions listed there,
+needing a second remote and a second collar.
 
-Expect this to reveal the frame layout — where the remote's identity sits, where the command sits, and whether there is a checksum. Note the safety asymmetry: capturing shock frames means being able to *transmit* them, so the collar must not be on the dog during this work.
-
-Beep-only remains the scope of the shipped firmware. This item is about understanding the protocol, not extending the device's capability.
+The safety asymmetry that made the work sensitive still holds: understanding the
+shock frames means being able to transmit them. The collar must not be on the dog
+during any of it, and beep-only remains the scope of the shipped firmware.
 
 ## RF constraints that look wrong but aren't
 
@@ -174,4 +302,9 @@ Two things about it are load-bearing, not decoration:
 
 ## Scope
 
-Beep only. Shock is deliberately out of scope. The captured signal is specific to one physical remote (each likely embeds a unique ID) — the committed payload is a structural template, not a universal key.
+Beep only. Shock is deliberately out of scope, and since 2026-09-06 that is a
+policy rather than a limitation: the frame is understood well enough to construct a
+shock frame, and the repo deliberately does not carry what would be needed to. The
+committed payload is specific to one physical remote and is a structural template,
+not a universal key — though "each handset embeds a unique ID" remains an untested
+assumption, not a finding. See "Frame structure".

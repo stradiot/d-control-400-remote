@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# Refuse to commit the two sops-encrypted files in plaintext.
+#
+#   include/signal.h        the captured RF payload
+#   signal_captures.txt     the decoded frame worksheet, which carries the
+#                           handset's 68 constant identity runs and the
+#                           level-to-value table
+#
+# Both are encrypted to the age recipient in .sops.yaml and neither has ever
+# been committed in the clear. This hook is what keeps that true, because the
+# failure mode is quiet: `sops -d -i` leaves valid-looking content in the file,
+# and a `git add -A` picks it up without complaint.
+#
+# The staged blob is checked rather than the working tree, because those can
+# differ — a decrypted working copy with ciphertext staged is fine, and the
+# reverse is the accident being guarded against.
+
+secrets='include/signal.h signal_captures.txt'
+status=0
+
+is_encrypted() {
+    # sops JSON carries a top-level "sops" key and an ENC[...] envelope.
+    printf '%s' "$1" | grep -q '"sops"' || return 1
+    printf '%s' "$1" | grep -q 'ENC\[AES256_GCM' || return 1
+    return 0
+}
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+for f in $secrets; do
+    if printf '%s\n' "$staged" | grep -qxF "$f"; then
+        if ! is_encrypted "$(git show ":$f" 2>/dev/null)"; then
+            echo "pre-commit: REFUSING -- $f is staged in PLAINTEXT." >&2
+            echo "  Encrypt it:  sops -e -i $f" >&2
+            echo "  If it was only read and not edited, restore a pre-decrypt snapshot" >&2
+            echo "  instead: 'sops -e -i' rolls a fresh data key and MAC, so it diffs" >&2
+            echo "  against HEAD even when the content is identical." >&2
+            status=1
+        fi
+    fi
+
+    # Not staged, but decrypted on disk. Warn rather than block -- this is a
+    # normal mid-analysis state, and it is also how a decrypted signal.h was
+    # once left in the working tree after a cleanup step lost its relative path.
+    if [ -f "$f" ] && ! is_encrypted "$(cat "$f")"; then
+        echo "pre-commit: WARNING -- $f is decrypted in the working tree." >&2
+    fi
+done
+
+exit $status

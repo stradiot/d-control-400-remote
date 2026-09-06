@@ -3,10 +3,10 @@
 This project replicates the control signal for a Dogtrace d-control 400 electric dog collar using a Wemos LOLIN C3 Mini (ESP32-C3) and a CC1101 transceiver module. The main goal of this project is to create a remote that can be triggered remotely (e.g., via Home Assistant). Integration with Home Assistant is possible through the included ESPHome configuration, allowing for remote triggering of the collar's sound beep function. The project is structured around a single button press (the BOOT button) that triggers the transmission of a raw RF signal captured from the original remote.
 
 ⚠️ IMPORTANT PROJECT SCOPE & DISCLAIMERS:
-* Unknown Protocol: The underlying communication protocol is not publicly available, so the precise byte frame to be used, the exact RF parameters, sync word, or checksum logic used by Dogtrace is unknown. This project does not attempt to reverse engineer the protocol or implement a true "clone" of the remote.
-* Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR, cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote. The signal is transmitted via bit-banging asynchronous timings, mimicking the original system's Pulse Width Modulated (PWM) bit-stream without requiring formal protocol decoding.
+* Undocumented Protocol: Dogtrace publishes nothing about the link. The frame has since been reverse engineered from SDR captures far enough to describe its structure — see [What the frame looks like](#-what-the-frame-looks-like) — but **the firmware does not use that**. It still replays a stored payload verbatim, and this is not a universal "clone" of the remote.
+* Raw Replay: The signal transmitted by this code is a raw, fixed-code payload meant to be captured using an SDR, cleaned up, fine-tuned, and repeated. The RF parameters used here are fine-tuned to work, but may not be the exact parameters used by the original remote. The signal is transmitted by bit-banging asynchronous timings. It is **not** PWM, despite what earlier revisions of this file said — the encoding is run-length, with all the information in the durations and none in the levels. PWM would require exactly half the runs to be long; the real frames have 21 long runs out of 88.
 * Device Specific & Template Only: The original signal used to develop this project was specific to my personal remote. It is not a universal signal for all Dogtrace d-control 400 remotes, as each remote likely has a unique identifier embedded in the signal to prevent cross-interference. Instead, this code provides a structural template. To replicate a new remote, its signal has to be captured using an SDR, the timings have to be extracted and cleaned up, and then injected into the code as described in the "Adding Custom Signal" section below.
-* Beep Only: This repository is currently structured around the sound beep function. It could easily be extended to include the shock function by capturing that specific button press, but that is not the scope of this project at the moment.
+* Beep Only: This repository is structured around the sound beep function, and that is now a deliberate policy rather than a gap. The shock frames have been captured and analysed; the repository deliberately does not carry what would be needed to construct one.
 
 ---
 
@@ -198,6 +198,8 @@ Using the Linux path on macOS fails with `identity did not match any of the reci
 
 Confirm the right key is installed with `age-keygen -y <path>`, which prints the *public* key and must match the recipient in `.sops.yaml`. That verifies decryption will work without touching the encrypted file and without putting the private key on screen.
 
+A pre-commit hook enforces this. `.githooks/pre-commit` refuses any commit that stages `include/signal.h` or `signal_captures.txt` in plaintext, and warns when either is left decrypted in the working tree. It inspects the staged blob rather than the file on disk, and detects encryption by looking for sops's own markers, so it needs no age key. Enable it in a fresh clone with `git config core.hooksPath .githooks` — note that a local `core.hooksPath` replaces any global one, which is why `.githooks/prepare-commit-msg` exists to chain through to it, complete with a re-entry guard that stops the two-hop loop you get when a global hook chains back into the repo's local one.
+
 Re-encrypt with `sops -e -i include/signal.h` before committing; a decrypted `signal.h` must never be committed. If the plaintext was only read and not modified, restoring a pre-decrypt copy is preferable — `sops -e -i` generates a fresh data key and MAC, so it produces a diff even when the content is identical.
 
 To use this project, the RF signal for the specific remote to be cloned has to be captured using an SDR (Software Defined Radio) set to AM/ASK mode. The captured microsecond timings then have to be injected into the code.
@@ -340,6 +342,99 @@ Integration to Home Assistant is possible with the ESPHome configuration include
 
 ---
 
+## 📻 What the frame looks like
+
+Decoded in September 2026 from a differential capture campaign — beep and shock,
+channels A and B, all 20 shock levels, 42 distinct frames extracted from raw IQ
+and cross-checked against hand measurements in Universal Radio Hacker.
+
+Every frame this handset sends is **88 runs** of one or two symbol periods
+(T = 208.647 µs), and the encoding is **run-length**: the levels carry no
+information at all, because two adjacent runs at the same level would merge into
+one. Everything is in the durations. That rules out NRZ, Manchester, PWM and PPM
+outright, and `ticks = 88 + (number of long runs)` holds as an identity on every
+frame measured.
+
+Of the 88 runs, **68 are identical across everything the handset transmits** —
+both functions, both channels, all 20 intensity levels. The remaining 20 carry the
+whole command surface. Writing `A` for a short run and `B` for a long one:
+
+```
+run     field
+0-30    preamble          31 short runs
+31-44   constant          handset-specific
+45-46   channel           AB = channel A,  BA = channel B
+47-66   constant          handset-specific
+67-68   function          AB = beep,       BA = shock
+69-70   constant          handset-specific
+71-78   level             8 runs, MSB first, long = 1
+79-86   redundancy        run 79+i against run 71+i:
+                            i = 0..3   always complement
+                            i = 4,5    complement = shock, copy = beep
+                            i = 6,7    (complement, copy) = channel A
+                                       (copy, complement) = channel B
+87      constant          always short
+```
+
+The 68 constant runs are what stays encrypted, along with the level-to-value table.
+The schema above is a property of the protocol and is discoverable by anyone with
+this model and an SDR; the constants are one specific handset's identity, and they
+are the only thing that makes a frame *this* remote's.
+
+The redundancy block is the nice part, and it is not a checksum. It is the level
+field re-emitted through a mask: four of its eight positions always invert the
+original, and the other four invert or copy depending on which channel and which
+function is being sent. Each command is therefore stated twice — once outright in
+its own field, and once as a perturbation of the redundancy. A receiver that
+validates the two halves against each other reads the command out of the comparison
+itself, which buys error detection and addressing from the same bits.
+
+Neither the channel nor the function field ever uses `AA` or `BB` — only the two
+transposed values. That admits two readings the captures cannot separate, because
+there are only two observations of each field: either they are two-bit fields with
+two states spare, leaving room for two more functions and two more channels, or
+they are one-bit fields in a balanced 1-of-2 code where `AA` and `BB` are invalid
+codewords and there is no headroom at all. The d-control range includes models with
+more channels, so a higher model in the family would settle it.
+
+The level-to-value map is a monotone but strongly non-linear lookup table across
+the 20 dial positions, with no formula recovered. It lives in the *remote* — the
+handset decides what value to send — so the collar holds a second, different map
+from value to electrical output. If that value is a physical quantity such as a
+pulse width, a formula may exist behind the table; establishing that means
+instrumenting the collar's output, not capturing more RF.
+
+Three questions the captures cannot settle, in descending order of what they would
+buy:
+
+* **Are those 68 constant runs really a per-handset identifier?** They are constant
+  under every axis a single handset can vary, which is a much weaker claim, and it is
+  the assumption the "Device Specific" disclaimer above has always rested on.
+  **Settling it requires a second remote** — nothing that can be captured from this
+  one will do it. Diffing two handsets splits the constant block into what differs
+  (identity) and what agrees (protocol framing), with one caveat worth designing for
+  in advance: two remotes may also differ by firmware or protocol revision, since each
+  remote and collar ships as a pair. A revision field would show up in that same diff.
+  A third handset disambiguates, and so does the structural tell — an identifier is
+  likely one contiguous field, a revision counter likely sits apart and takes small
+  values.
+* **Is there a formula behind the level-to-value map?** The 20 values are monotone
+  and strongly non-linear, and nothing has been recovered from the numbers alone. The
+  map lives in the *remote*, so the collar holds a second and separate map from value
+  to electrical output. If the transmitted value is a physical quantity — a pulse
+  width being the plausible one for a switched source — then the table is samples of a
+  curve rather than an arbitrary lookup. Testing that means instrumenting the collar's
+  output against the value, so it needs an oscilloscope and the hardware already on the
+  bench rather than a second remote, which makes it the cheapest of the three.
+  ⚠️ Same condition as the capture work: the collar must not be worn by an animal.
+* **Is the two-collar limit enforced by the protocol?** *(Highly optional.)* Nothing
+  in the frame enforces it; the channel is simply two more address runs, so pairing
+  two collars to the same channel should make both fire. This tests the system rather
+  than the protocol and nothing else depends on the answer — it is recorded because it
+  is a clean prediction, not because it justifies buying a collar.
+
+---
+
 ## Possible future improvements
 
 ### 1. Move transmission from the CPU to the RMT peripheral
@@ -350,13 +445,17 @@ The ESP32-C3's **RMT** peripheral — Remote Control Transceiver, built for exac
 
 The frame fits neatly: an RMT symbol packs two level+duration entries, so 88 runs = **44 symbols** against a 48-symbol channel block. The open question is whether the C3 supports hardware TX looping, or whether continuous output needs a wrap-around refill interrupt.
 
-### 2. Capture the shock signal at several levels, and the B channel
+### 2. ~~Capture the shock signal at several levels, and the B channel~~ — done
 
-The protocol is **not decoded** — this is a verified replay. Decoding needs differential data rather than more of the same: frames that differ *only* in intensity localise the level field, and channel A versus B localises the channel field. A single frame in isolation is undecodable; a family of frames varying along known axes is not.
+Closed in September 2026. The campaign covered beep and shock across both channels
+and all 20 levels, and the layout is summarised in
+[What the frame looks like](#-what-the-frame-looks-like). What remains are the two
+hardware questions listed there, needing a second remote and a second collar.
 
-That should expose the frame layout — where the remote's identity lives, where the command lives, and whether a checksum is present. It would turn this from a device that replays one captured remote into one that understands the protocol.
-
-⚠️ Capturing shock frames implies being able to transmit them. **The collar must not be worn by an animal during this work.** Beep-only remains the scope of the shipped firmware; this item is about understanding the protocol, not extending what the device does.
+⚠️ Understanding the shock frames means being able to transmit them. **The collar
+must not be worn by an animal during this kind of work.** Beep-only remains the
+scope of the shipped firmware, and the repository deliberately does not carry what
+would be needed to build a shock frame.
 
 ---
 

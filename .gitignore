@@ -11,3 +11,8 @@ compile_commands.json
 
 # clangd's index, written next to compile_commands.json.
 .cache/
+
+# Per-machine Claude Code permissions. These carry absolute paths from whichever
+# machine wrote them, and this repo is public. The shared settings.json, if one
+# is ever added, is deliberately not matched.
+**/.claude/settings.local.json

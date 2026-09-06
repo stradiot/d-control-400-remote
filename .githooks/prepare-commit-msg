@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# Passthrough to the user's global prepare-commit-msg, if there is one.
+#
+# This repo sets a local core.hooksPath so .githooks/pre-commit runs. A local
+# core.hooksPath REPLACES the global one rather than adding to it, so without
+# this shim a global hook would silently stop running here.
+#
+# The re-entry guard is load-bearing, not defensive. A global hook may itself
+# chain into the repo's local hook, resolving it with
+# `git rev-parse --git-path hooks/prepare-commit-msg` -- which honours
+# core.hooksPath and therefore resolves to THIS FILE. Shim execs global, global
+# calls local, local execs global: a two-hop cycle that a global hook's own
+# "don't call myself" check cannot see. It forks until the process table fills.
+# The variable below breaks the cycle on the second entry and lets the global
+# hook get on with its job.
+#
+# Resolved at run time, so no path into anyone's home directory is baked into a
+# public repo.
+
+[ -n "${GIT_HOOK_CHAIN_DCONTROL400:-}" ] && exit 0
+
+global=$(git config --global --get core.hooksPath) || exit 0
+[ -n "$global" ] || exit 0
+case $global in
+    '~'*) global=$HOME${global#\~} ;;
+esac
+hook=$global/prepare-commit-msg
+[ -x "$hook" ] || exit 0
+
+GIT_HOOK_CHAIN_DCONTROL400=1
+export GIT_HOOK_CHAIN_DCONTROL400
+exec "$hook" "$@"
