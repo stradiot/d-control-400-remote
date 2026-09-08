@@ -1,6 +1,6 @@
 # Dogtrace d-control 400 remote clone (ESP32-C3 + CC1101)
 
-A small ESP32-C3 board that reproduces the *beep* command of a Dogtrace d-control 400 dog collar, so the recall tone can be triggered from Home Assistant instead of only from the handheld remote. The beep is the useful half of that device — a recall signal — and having it reachable from automation means it still works when the remote is on the kitchen table.
+A small ESP32-C3 board that reproduces the *beep* command of a Dogtrace d-control 400 dog collar, making it triggerable from Home Assistant rather than only from the handheld remote.
 
 The repository contains everything needed to build one: firmware for two runtimes (bare PlatformIO, and ESPHome for the Home Assistant path), a fabrication-ready PCB, a 3D printable enclosure, the SDR analysis script, and a written account of how the radio link was measured and decoded.
 
