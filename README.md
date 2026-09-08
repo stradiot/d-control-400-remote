@@ -123,7 +123,7 @@ The dark rectangle sitting under the C3's antenna is the pour keepout, and it is
 
 **Layout**
 
-* **Module placement.** The two modules sit at opposite ends of the board with their antennas pointing outwards. The CC1101's antenna overhangs the board edge completely, with no substrate underneath to detune or absorb it, and the C3 Mini is oriented so that its own antenna faces the other edge — which also puts its USB-C connector past the opposite edge, where the enclosure cutout can reach it.
+* **Module placement.** The two modules sit at opposite ends of the board. The CC1101 is positioned so its antenna overhangs the board edge completely, with no substrate underneath to detune or absorb it. The C3 Mini is at the other end with its USB-C connector overhanging that edge, where the enclosure cutout reaches it — but its own antenna cannot be given the same treatment, because it falls close to the centre of the board, over laminate and copper pour. That is what the keepout below is for.
 * **ESP antenna keepout.** A copper-pour keepout sits under the ESP32-C3's onboard antenna on **both** layers, so the antenna radiates through bare laminate rather than over a ground plane. It is a rectangle roughly 12 mm wide that extends about 3 mm past the end of the module, so the fringing field clears the pour as well as the antenna trace itself.
 * **Mounting holes.** 2.032 mm at the corners, with the pour pulled back for clearance around the hardware.
 * **Radio footprint.** The CC1101 header is 1×8 on a 2.00 mm pitch (`header-pin-1x8-2.00`), verified against the module.
@@ -134,14 +134,9 @@ The dark rectangle sitting under the C3's antenna is the pour keepout, and it is
 * Ground pins tie into a full-coverage polygon pour through thermal reliefs, so the ground is solid but the pads still take a hand-soldering iron.
 * DRC minimum track width was tuned to the design and the board passes cleanly.
 
-**Manufacturing**
+**Ordering**
 
-| Parameter | Value |
-| :--- | :--- |
-| Layers / stackup | 2, FR-4, 1.6 mm, 1 oz copper |
-| Surface finish | HASL (with lead) — easier wetting for hand assembly with leaded solder |
-| Solder mask | Black |
-| Fab marks | "Remove Order Number" selected |
+Fab defaults are fine for everything except board thickness: order **1.6 mm**, which is what the enclosure's standoffs are dimensioned for. The 0.5 mm power trace assumes 1 oz copper. Everything else — material, surface finish, mask colour — is free choice; the photographed board is black with leaded HASL because it was hand-assembled with leaded solder.
 
 ---
 
@@ -159,7 +154,7 @@ Only the carrier frequency comes from a datasheet. The rest were derived from SD
 | Sync word | Disabled | Raw pulses; the packet engine is bypassed entirely. |
 | Preamble / CRC | Disabled | Same reason — asynchronous direct mode. |
 | Transmission mode | Asynchronous direct | GDO0's logic level maps straight to the PA. HIGH = RF on, LOW = RF off. |
-| Symbol period | 208.647 µs (stored as `209`) | Measured, not rounded. Every run is one or two of these. See [Measuring the symbol period](#5-measuring-the-symbol-period). |
+| Symbol period | 208.647 µs (stored as `209`) | Measured, not rounded. Every run is one or two of these. See [Measuring the symbol period](#measuring-the-symbol-period). |
 
 ---
 
@@ -209,24 +204,6 @@ The three knobs are layered and not independent:
 
 The collar tolerates more than contiguity within a burst: with the gap set to zero at runtime on the standalone path, 126 frames ran back-to-back over 2.87 s — the shape of a real button hold rather than a series of taps — and decoded 6/6. So the receiver does not need periodic silence to resettle. The gap exists to give the ESPHome path somewhere to feed the watchdog, not because the radio link wants it.
 
-If the beep chops at range, that is RF margin rather than a timing defect, and `FRAMES_PER_BURST` does not control the size of a chop. Each frame carries its own preamble and is independently acquirable, so a lost decode drops the tone for about one frame regardless of how many frames make up a burst. Measured: 6/6 clean at 3 m line-of-sight against 8/12 chopped at 5 m through a load-bearing wall, with every transmitter-side variable held fixed.
-
-### 5. Measuring the symbol period
-
-The symbol period is **208.647 µs**, stored as `209`. It was measured, not guessed, from RTL-SDR captures at 2.000 MSps.
-
-**Measure frame-start to frame-start.** Take the rising edge that opens the first frame of a press and the rising edge that opens the seventh: 272 910 samples spanning exactly 654 symbol periods, giving 417.294 samples per period. The six intermediate estimates agree to within 0.02%.
-
-Two things make that the right baseline, and both are about the *endpoints* rather than the span:
-
-* Both endpoints are **rising edges at the same structural position**, so rise-time bias is identical at each end and cancels rather than accumulating. (Measuring edge-to-edge across a single pulse biases high by the rise and fall time.)
-* There is **no ambiguity about how many periods the span contains.** A press ends when the button is released, which truncates the *final frame* at an arbitrary point — so the total period count of a whole message is not knowable, and dividing the whole message span by it is guesswork. Two frame starts sidestep that completely.
-
-An earlier estimate of 417.75 samples came from the run of alternating short pulses at a frame boundary, taken to be a 42-period preamble. It is 0.11% high for the obvious reason — a 16× shorter baseline carries 16× the endpoint error — and the decode later showed the premise was wrong too. The preamble is 31 short runs; the *visible* alternating stretch is the preamble plus however many short runs trail the previous frame, which is data-dependent and therefore not a fixed length to measure across. An older revision of this project used 200 µs, which is 4% fast.
-
-⚠️ URH's *Autodetect parameters* reports 400 samples/symbol here — wrong by 9% — because it fits a symbol length rather than measuring one. Hand measurement caught it.
-
-**Independently reproduced by hand,** with no scripting: URH set to ASK, Samples/Symbol 418, Error tolerance 5, Bits/Symbol 1, yielding 764 bits — one frame seven times over with zero mismatches. Worth knowing: at Error tolerance 0 the same capture silently loses five bits and produces seven frames that disagree with each other, while still looking entirely plausible to the eye.
 
 ---
 
@@ -265,13 +242,9 @@ The level-to-value map is a monotone but strongly non-linear lookup table across
 
 **What is published here and what is not.** The schema above is a property of the protocol, discoverable by anyone with this model and an SDR, so it is written down. The 68 constant runs and the level-to-value table are one specific handset's identity, and they are the only thing that makes a frame *this* remote's; those stay encrypted.
 
-### Three questions the captures cannot settle
+### The open question behind the "device specific" disclaimer
 
-In descending order of what they would buy:
-
-* **Are the 68 constant runs really a per-handset identifier?** They are constant under every axis a single handset can vary, which is a much weaker claim, and it is what the "device specific" disclaimer at the top has always rested on. **Settling it requires a second remote** — nothing captured from this one will do it. Diffing two handsets splits the constant block into what differs (identity) and what agrees (protocol framing), with one confounder worth designing for in advance: two remotes may also differ by firmware revision, since each remote and collar ships as a pair. A third handset disambiguates, and so does the shape — an identifier is likely one contiguous field, a revision counter likely sits apart and takes small values.
-* **Is there a formula behind the level-to-value map?** Nothing has been recovered from the numbers alone. If the transmitted value is a physical quantity — a pulse width being plausible for a switched source — then the table is samples of a curve rather than an arbitrary lookup. Testing that means instrumenting the collar's output against the value, so it needs an oscilloscope and the hardware already on the bench rather than a second remote, which makes it the cheapest of the three. ⚠️ The collar must not be worn by an animal during that work.
-* **Is the two-collar limit enforced by the protocol?** *(Highly optional.)* Nothing in the frame enforces it; the channel is simply two more address runs, so pairing two collars to the same channel should make both fire. This tests the system rather than the protocol and nothing else depends on the answer — it is recorded because it is a clean prediction, not because it justifies buying a collar.
+The 68 constant runs are *assumed* to be this handset's identity, and that assumption has never been tested. All that has been shown is that they are constant under every axis a single handset can vary, which is a much weaker claim. **Settling it requires a second remote** — nothing captured from this one will do it. Diffing two handsets splits the constant block into what differs (identity) and what agrees (protocol framing), with one confounder worth designing for in advance: two remotes may also differ by firmware revision, since each remote and collar ships as a pair. A third handset disambiguates, and so does the shape — an identifier is likely one contiguous field, a revision counter likely sits apart and takes small values.
 
 ---
 
@@ -317,6 +290,17 @@ Two capture-side traps are worth naming, because both cost a session here:
 
 * **Tune off-centre.** The RTL2832U places a DC spike at whatever frequency it is tuned to, so a carrier captured dead centre sits under an artefact that is not in the air. The 869.525 MHz signal was captured at 869.275 MHz — 250 kHz low.
 * **Turn the gain down.** With the remote held close and the gain up, the waterfall showed three marks, not one: the real burst, its I/Q image mirrored about the tuned centre, and a third-order intermodulation product at roughly three times the baseband offset. The test that separates them is to retune and see what moves — real transmissions stay put on an absolute axis, images and distortion products follow your tuning. Use manual gain, not AGC, so nothing modulates the amplitudes you are trying to measure.
+
+### Measuring the symbol period
+
+Everything else falls out of `BASE_TICK_US`, so it is the one number to measure rather than estimate. **Take it frame-start to frame-start**: the rising edge that opens one frame against the rising edge that opens a frame several repeats later, divided by the number of symbol periods between them. Here that was 272 910 samples across exactly 654 periods at 2.000 MSps — 417.294 samples per period, or **208.647 µs**, with the six intermediate estimates agreeing to within 0.02%.
+
+Two properties of that baseline are what make it trustworthy, and both are about the endpoints rather than the span:
+
+* Both endpoints are **rising edges at the same structural position**, so rise-time bias is identical at each end and cancels instead of accumulating. Measuring edge-to-edge across a single pulse biases high by the rise and fall time.
+* **The period count is known exactly.** A press ends when the button is released, which truncates the final frame at an arbitrary point, so the total period count of a whole message is not knowable and dividing by it is guesswork. Two frame starts sidestep that.
+
+⚠️ Do not let a tool fit the symbol length for you. URH's *Autodetect parameters* reports 400 samples/symbol on this signal — wrong by 9%.
 
 ---
 
@@ -404,14 +388,9 @@ The standalone firmware exposes its RF parameters over the serial monitor (11520
 | `t` | Transmit one full sequence — all `r` bursts |
 | `?` | Print current state and computed frame / burst / sequence durations |
 
-This was originally built to sweep the symbol period, which is no longer a live question: `BASE_TICK_US` was measured directly at 208.647 µs, and the reliability problem it was built to chase turned out to be burst structure rather than the timebase. There is no free parameter left to discover. What the console is still good for:
+It exists so that a new capture can be brought in without a reflash between trials, which is the situation these parameters are actually uncertain in. The values committed here are already settled, so nothing needs sweeping on a working build.
 
-* **`b`** — finding how many contiguous frames the collar actually needs. 1 is known-dead, 7 is a real tap; sweeping upward finds the threshold in between.
-* **`g 0`** — driving the radio continuously, with no silence anywhere in the sequence. This is the shape an RMT-based implementation would produce, and it is how that idea was validated before writing any of it.
-* **`p`** — separating an RF-margin problem from a firmware one by walking power down at a fixed distance.
-* **`m`** — A/B-ing the two timing engines at the same settings. Note that at short range there is enough margin that both decode, so a null result there means the test geometry could not exercise the difference, not that the engines are equivalent.
-
-Diagnostic note: a wrong symbol period produces *intermittent* triggering; a wrong burst structure produces *no* triggering at all. If the collar never responds, check `FRAMES_PER_BURST` and where the gap sits before touching the timebase — no amount of sweeping will find that fault.
+When bringing up your own signal, the useful diagnostic is that the two common faults look different: a wrong symbol period produces *intermittent* triggering, a wrong burst structure produces *none at all*. If the collar never responds, check `FRAMES_PER_BURST` and where the gap sits before touching the timebase — no amount of sweeping will find that fault.
 
 > **Safety:** the transmit sequence runs with the FreeRTOS scheduler suspended. Any `k`, `b`, `r` or `g` change that would push the sequence past ~4 s is rejected and the previous value kept, so the console cannot set up a multi-second blocking transmit.
 
