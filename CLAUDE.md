@@ -42,13 +42,26 @@ esphome run d-control-400.yaml --device d-control-400.local   # OTA
 esphome logs d-control-400.yaml
 ```
 
-`upload_port` / `monitor_port` in `platformio.ini` are hardcoded to `/dev/tty.usbmodem101` — expect to change these per machine.
+`platformio.ini` deliberately sets **no** `upload_port` / `monitor_port`. The
+`lolin_c3_mini` board definition declares hwids `303A:1001` (Espressif VID +
+USB Serial/JTAG PID), so PlatformIO finds the board by VID/PID and the file
+stays machine-independent. Override per invocation only when several Espressif
+boards are attached:
+
+```bash
+pio run -t upload --upload-port /dev/cu.usbmodem101
+```
+
+Prefer `/dev/cu.*` over `/dev/tty.*` on macOS: `tty.*` is the callin device and
+blocks on open until DCD asserts, which a USB CDC-ACM device typically never
+does. Do not re-add hardcoded ports — that only ever meant editing this file on
+every machine.
 
 There are no tests. `test/`, `lib/`, and `include/README` are empty PlatformIO scaffolding placeholders.
 
 ## A fresh clone does not compile
 
-`include/signal.h` is **SOPS + age encrypted** (see `.sops.yaml`) — the checked-in file is JSON ciphertext, not C. Building requires either decrypting it (`sops -d include/signal.h`) with the age key, or replacing it with your own captured signal using the template in the README's "Adding Custom Signal" section. `include/pinout.h` is plaintext and committed as-is.
+`include/signal.h` is **SOPS + age encrypted** (see `.sops.yaml`) — the checked-in file is JSON ciphertext, not C. Building requires either decrypting it (`sops -d include/signal.h`) with the age key, or replacing it with your own captured signal using the template in the README's "Providing your own signal" section. `include/pinout.h` is plaintext and committed as-is.
 
 `signal_captures.txt` is encrypted under the same `.sops.yaml` rules and to the same age recipient. It is the decoded frame worksheet, not a build input — nothing includes it.
 
