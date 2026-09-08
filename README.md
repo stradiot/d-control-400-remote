@@ -238,7 +238,7 @@ The redundancy block is the interesting part, and it is not a checksum. It is th
 
 Neither the channel nor the function field ever uses `AA` or `BB` — only the two transposed values. That admits two readings the captures cannot separate, since there are only two observations of each field: either they are two-bit fields with two states spare, leaving room for two more functions and two more channels, or they are one-bit fields in a balanced 1-of-2 code where `AA` and `BB` are invalid codewords and there is no headroom at all. The d-control range includes models with more channels, so a higher model in the family would settle it.
 
-The level-to-value map is a monotone but strongly non-linear lookup table across the 20 dial positions, with no formula recovered. It lives in the *remote* — the handset decides what value to send — so the collar holds a second, different map from value to electrical output.
+The level field takes 20 distinct values across the 20 dial positions, read MSB first as an 8-bit number. That sequence is monotone and strongly non-linear, and no formula has been recovered from it. What the value *means* is unknown: nothing here establishes whether it is a physical quantity or simply an opaque index, and RF capture alone cannot say.
 
 **What is published here and what is not.** The schema above is a property of the protocol, discoverable by anyone with this model and an SDR, so it is written down. The 68 constant runs and the level-to-value table are one specific handset's identity, and they are the only thing that makes a frame *this* remote's; those stay encrypted.
 

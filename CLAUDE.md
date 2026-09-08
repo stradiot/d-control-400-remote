@@ -173,11 +173,13 @@ two-bit fields with two spare states (room for two more functions and two more
 channels), or one-bit fields in a balanced 1-of-2 code where `AA`/`BB` are invalid.
 A higher model in the d-control range, which has more channels, would settle it.
 
-The level-to-value map is monotone, strongly non-linear, and has no formula behind
-it. It lives in the **remote** — the handset decides what value to send — so the
-collar holds a separate value-to-output map. A formula may exist if the value is a
-physical quantity such as a pulse width; testing that means instrumenting the
-collar, not capturing more RF.
+The level field takes 20 distinct values across the 20 dial positions, read MSB
+first as an 8-bit number. That sequence is monotone, strongly non-linear, and has
+no formula behind it. **What the value means is unverified.** Nothing captured
+establishes whether it is a physical quantity such as a pulse width or an opaque
+index, and therefore nothing establishes that the collar performs any second
+mapping of its own. Do not write either as fact; settling it means instrumenting
+the collar, not capturing more RF.
 
 **What stays encrypted in `signal_captures.txt`:** the 68 constant runs and the
 level-to-value table. The schema above is protocol structure, discoverable by
@@ -194,13 +196,14 @@ Three things the captures cannot settle, in descending order of what they buy:
   the confounder that two handsets may also differ by firmware revision, since remote
   and collar ship as a pair. A third handset disambiguates; so does the shape, an
   identifier being likely contiguous and a revision counter likely separate and small.
-- **Is there a formula behind the level-to-value map?** Monotone, strongly
-  non-linear, nothing recovered from the numbers alone. The map lives in the remote,
-  so the collar holds a separate value-to-output map. If the transmitted value is a
-  physical quantity — pulse width being plausible for a switched source — the table is
-  samples of a curve. Testing it means instrumenting the collar's output, so it needs a
-  scope and the hardware already here rather than a second remote: the cheapest of the
-  three. The collar must not be on the dog during that work.
+- **What is the transmitted level value?** Monotone and strongly non-linear across
+  the 20 dial positions, nothing recovered from the numbers alone. Whether it is a
+  physical quantity — pulse width being plausible for a switched source, which would
+  make the table samples of a curve — or an opaque index is unverified, and so is
+  anything that follows from it about what the collar does with the value. Settling
+  it means instrumenting the collar's output, so it needs a scope and the hardware
+  already here rather than a second remote: the cheapest of the three. The collar
+  must not be on the dog during that work.
 - **Is the two-collar limit real?** *Highly optional.* Nothing in the frame enforces
   it — the channel is just two more address runs, so pairing two collars to one
   channel should make both fire. Tests the system rather than the protocol, and
