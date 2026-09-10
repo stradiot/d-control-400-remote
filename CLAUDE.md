@@ -231,7 +231,7 @@ The historic 70% reliability was never a timing problem. It was burst structure,
 
 The gap exists solely because the waveform is bit-banged from the CPU with the scheduler suspended, which forces a three-way trade between contiguity, watchdog starvation, and audible chopping. The ESP32-C3's RMT peripheral clocks a pulse train out of a buffer in hardware with no CPU involvement, which removes all three constraints at once — no `vTaskSuspendAll()`, no gap, no watchdog exposure, and timing immune to Wi-Fi activity. It would also allow a genuinely continuous transmission for the full beep duration, exactly like a button hold, which the current design cannot do at all.
 
-The frame fits: each RMT symbol holds two level+duration entries, so 88 runs = **44 symbols**, against a 48-symbol channel block on the C3. Open question is whether the C3 supports hardware TX looping or whether continuous output needs a wrap-around refill interrupt (ping-pong on the half-buffer threshold).
+The frame fits, and the numbers are now read out of the TRM (ch. 33) rather than assumed: each 32-bit RAM word holds two 16-bit pulse codes of 1-bit level plus 15-bit period, so 88 runs = **44 words** against a 48-word channel block — 96 pulses of capacity, no memory reconfiguration needed. The C3 *does* support hardware TX looping (`RMT_LL_MAX_LOOP_COUNT_PER_BATCH` = 1023); what remains open is how to build a contiguous burst from it, and what happens at the seam between loop iterations and between batches.
 
 ### 2. Decode the protocol — done 2026-09-06
 
