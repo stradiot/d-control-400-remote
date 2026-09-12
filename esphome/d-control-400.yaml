@@ -7,6 +7,7 @@ esphome:
     - cc1101.h
     - ../include/pinout.h
     - ../include/signal.h
+    - ../include/rmt_beep.h
   libraries:
     - SPI
     - jgromes/RadioLib@^6.0.0
@@ -98,6 +99,11 @@ light:
     num_leds: 1
     name: "Status LED"
     id: status_led
+    # MANDATORY, not a tuning knob. ESPHome defaults this to 96 on the ESP32-C3,
+    # which is two of the RMT's 48-word memory blocks, and a two-block channel
+    # claims its neighbour's. The C3 has exactly two TX-capable channels, so at 96
+    # the LED consumes both and rmt_beep::init() has nowhere to go.
+    rmt_symbols: 48
     # Disable ESPHome's default 1-second fade animation for instant response
     default_transition_length: 0s
     internal: true
@@ -159,8 +165,11 @@ script:
   # Why the chip last reset. The ROM prints this on UART0 at boot, but those
   # messages never reach the network log, so re-emit it as a normal log line.
   #   BROWNOUT           -> the supply rail sagged; PA duty is too high for the LDO
-  #   TASK_WDT / INT_WDT -> the scheduler was starved by vTaskSuspendAll()
-  # The two have opposite fixes, which is the whole reason for logging it.
+  #   TASK_WDT / INT_WDT -> the scheduler was starved
+  # The two have opposite fixes, which is the whole reason for logging it. The
+  # watchdog half was a live failure while the frame was bit-banged under
+  # vTaskSuspendAll(); the RMT path never suspends the scheduler, so a TASK_WDT
+  # here now would mean something new rather than something known.
   - id: log_reset_reason
     mode: single
     then:
@@ -180,7 +189,14 @@ script:
           }
           ESP_LOGW("boot", "last reset reason: %s", why);
 
-  # Script to transmit the beep sequence
+  # Script to transmit the beep.
+  #
+  # mode: single is the ignore-while-busy policy: a second trigger arriving while
+  # this is running is dropped with a warning rather than queued or restarted. That
+  # is deliberate -- the device emits one precise beep per press and does not try to
+  # reproduce the original remote's press-and-hold behaviour. cc1101_ctrl refuses a
+  # concurrent start independently, so the switch and the physical button cannot race
+  # past the script into a half-started transmission.
   - id: transmit_beep
     mode: single
     then:
@@ -198,18 +214,31 @@ script:
                 blue: 1.0
             # 2. Yield 500ms so ESPHome can physically push the Blue color to the LED
             - delay: 500ms
-            # 3. Hijack the CPU and bit-bang the SDR timings to the radio
+            # 3. Hand the frame to the RMT. This returns immediately; the peripheral
+            #    clocks the whole beep out of its own memory with no CPU involvement.
             - lambda: |-
-                if (!cc1101_ctrl::transmit_beep_signal()) {
+                if (!cc1101_ctrl::begin_transmission()) {
                   ESP_LOGE("cc1101", "Beep signal transmission failed!");
                 }
-            # 4. Turn LED off when finished
+            # 4. Wait for the hardware rather than for a fixed delay, so the script
+            #    stays running (and mode: single keeps holding off retriggers) for
+            #    exactly as long as the beep lasts. The timeout is a backstop: if the
+            #    loop-end interrupt never arrives the script must still finish and
+            #    release the radio, not wedge the switch on forever.
+            - wait_until:
+                condition:
+                  lambda: 'return !cc1101_ctrl::is_transmitting();'
+                timeout: 30s
+            # 5. Radio back to standby. SPI work, so it cannot happen in the RMT's
+            #    completion interrupt and has to be done here.
+            - lambda: 'cc1101_ctrl::end_transmission();'
+            # 6. Turn LED off when finished
             - light.turn_off: status_led
           else:
             - logger.log:
                 level: ERROR
                 format: "Cannot transmit: CC1101 Radio is not initialized!"
-      # 5. NEW: Reset the switch back to OFF in Home Assistant only after everything is done
+      # 7. Reset the switch back to OFF in Home Assistant only after everything is done
       - switch.template.publish:
           id: beep_switch
           state: OFF

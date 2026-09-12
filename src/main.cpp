@@ -5,53 +5,25 @@
 
 #include "signal.h"
 #include "pinout.h"
+#include "rmt_beep.h"
 
 SPIClass customSPI(FSPI);
-CC1101 radio = new Module(CC1101_CS, CC1101_GDO0, RADIOLIB_NC, RADIOLIB_NC, customSPI);
+// RADIOLIB_NC for the GPIO argument: GDO0 belongs to the RMT peripheral, and
+// RadioLib must never drive or reconfigure it. The CC1101 side of the pin is set up
+// by transmitDirect() over SPI, which is a register write and needs no MCU pin.
+CC1101 radio = new Module(CC1101_CS, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, customSPI);
 Adafruit_NeoPixel strip(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-// --- Dogtrace Signal ---
-// Run lengths in BASE_TICK_US units. Positive = RF ON, negative = RF OFF.
-constexpr int32_t beepTicks[] = SIGNAL_BEEP_TICKS;
-constexpr size_t payloadSize = sizeof(beepTicks) / sizeof(beepTicks[0]);
 
 // --- Runtime calibration parameters ---
 // Seeded from signal.h, mutable over serial so a parameter sweep does not
 // require a reflash per trial. Nothing is persisted; a reset restores defaults.
-uint32_t baseTickUs = BASE_TICK_US;
-uint16_t repeatCount = TRANSMIT_REPEAT;
-uint32_t gapUs = TRANSMIT_GAP_US;
-// Contiguous frames per burst, with no silence between them. This is the parameter
-// that decides whether the collar responds at all -- see the note in signal.h. The
-// remote emits 7 for a tap and 180 for a 4.1 s hold, never with an internal gap.
-uint16_t framesPerBurst = FRAMES_PER_BURST;
+// The symbol period and the beep length live in rmt_beep.
 int8_t outputPower = OUTPUT_POWER;
 float carrierMHz = CARRIER_FREQUENCY;
 
-// Timing engine selection.
-//   0 = legacy   : reproduces the original firmware bit-for-bit (per-edge micros()
-//                  restart, no synthesiser settle). This is the baseline to measure against.
-//   1 = deadline : absolute-deadline scheduling so digitalWrite() overhead stops
-//                  integrating across the frame, plus a synthesiser settle delay.
-//
-// Defaults to 1 because that is what the ESPHome path implements and what has been
-// validated against the collar in daily use; having the two paths differ in an
-// unexamined way is not worth the risk.
-//
-// Measured 2026-08-15, first hardware run of this firmware: 6/6 clean on mode 0 and
-// 5/6 clean on mode 1, i.e. statistically indistinguishable (Fisher p = 1.0) -- do
-// NOT read that as mode 0 winning. The geometry was short-range and unobstructed,
-// where there is enough RF margin that mode 0's stretched symbols still decode, so
-// the test could not exercise the difference. Mode 0 is kept as the A/B baseline.
-uint8_t timingMode = 1;
-
-// Sum of all run lengths in ticks; used for the watchdog budget check.
-uint32_t tickSum = 0;
-
-// vTaskSuspendAll() is held for the whole sequence (every burst and the gaps
-// between them), so it must finish well inside the 5 s task watchdog. Refuse
-// settings that would not.
-constexpr uint32_t WATCHDOG_BUDGET_US = 4000000;
+// True between handing a beep to the RMT and putting the radio back in standby.
+// The transmission itself runs in hardware, so loop() keeps running throughout.
+bool txActive = false;
 
 // --- Button Interrupt ---
 volatile bool buttonTriggered = false;
@@ -89,16 +61,21 @@ void clearLED() {
 // Non-blocking two-state pulse driven from loop(). Deliberately not a delay():
 // loop() has to stay responsive to the button flag and to serial commands.
 //
-// This cannot collide with the transmission the way the ESPHome path can.
-// triggerTransmit() blocks loop() for the whole sequence, so the heartbeat and
-// the timing-critical section are mutually exclusive by construction -- there is
-// no window in which strip.show() (which briefly masks interrupts) could land
-// inside transmitSequence().
+// The txActive guard is required, and it was not before the RMT migration. The old
+// transmit call blocked loop() for the whole sequence, so the heartbeat and the
+// transmission were mutually exclusive by construction. Now the beep runs in
+// hardware while loop() keeps turning, so both ends of the pulse have to stand
+// aside: starting one would overwrite the blue, and clearing one that began just
+// before the trigger would blank the LED for the whole beep.
 //
 // Period is measured pulse-start to pulse-start; lastHeartbeatMs is only
 // advanced when the LED lights. Unsigned arithmetic makes it millis()-rollover
 // safe, same as the debounce above.
 void pollHeartbeat() {
+    if (txActive) {
+        return;
+    }
+
     unsigned long now = millis();
 
     if (!heartbeatLit) {
@@ -122,83 +99,14 @@ void IRAM_ATTR handleButton() {
     }
 }
 
-// --- Timing helpers ---
-inline uint32_t ticksOf(int32_t v) {
-    return (uint32_t)(v < 0 ? -v : v);
-}
-
-uint32_t frameDurationUs() {
-    return tickSum * baseTickUs;
-}
-
-// One burst = framesPerBurst frames emitted back-to-back, no gap between them.
-uint32_t burstDurationUs() {
-    return (uint32_t)framesPerBurst * frameDurationUs();
-}
-
-// The whole on-air sequence for one trigger: repeatCount bursts, gap between bursts.
-uint32_t sequenceDurationUs() {
-    return (uint32_t)repeatCount * (gapUs + burstDurationUs());
-}
-
-void transmitSequence() {
-    // Suspend all FreeRTOS background tasks for absolute timing precision.
-    // burstDurationUs() is validated against WATCHDOG_BUDGET_US before any
-    // parameter change is accepted, so this cannot overrun the watchdog.
-    vTaskSuspendAll();
-
-    for (uint16_t repeat = 0; repeat < repeatCount; repeat++) {
-        // Ensure PA is OFF during the inter-burst gap. Nothing separates the frames
-        // inside a burst -- that contiguity is what the collar's decoder needs.
-        //
-        // Note this gap sits INSIDE the vTaskSuspendAll() region, so unlike the
-        // ESPHome path it yields to nothing -- no scheduler, no idle task, no Wi-Fi.
-        // It is pure RF-side silence and buys this path no scheduling headroom at
-        // all. `g 0` was tested on hardware 2026-08-15 (6/6 clean, 126 contiguous
-        // frames over ~2.87 s) and the collar decoded it fine, which matches the
-        // capture: a real 4.14 s hold is 180 contiguous frames with no gap.
-        //
-        // gapUs is still seeded from TRANSMIT_GAP_US, which must stay non-zero
-        // because signal.h is shared with the ESPHome path, where the gap is outside
-        // the suspend and is where feed_wdt() runs. Zeroing it there reboots the
-        // device on the task watchdog.
-        digitalWrite(CC1101_GDO0, LOW);
-        delayMicroseconds(gapUs);
-
-        if (timingMode == 1) {
-            // Schedule every edge against one timebase taken at the start of the
-            // burst, so the per-edge digitalWrite() cost does not accumulate across
-            // all framesPerBurst * payloadSize edges.
-            uint32_t next = micros();
-            for (uint16_t frame = 0; frame < framesPerBurst; frame++) {
-                for (size_t i = 0; i < payloadSize; i++) {
-                    next += ticksOf(beepTicks[i]) * baseTickUs;
-                    digitalWrite(CC1101_GDO0, (beepTicks[i] > 0) ? HIGH : LOW);
-                    while ((int32_t)(micros() - next) < 0);
-                }
-            }
-        } else {
-            // Legacy path: micros() is sampled after the write, so each pulse
-            // is stretched by the write overhead and the error integrates.
-            for (uint16_t frame = 0; frame < framesPerBurst; frame++) {
-                for (size_t i = 0; i < payloadSize; i++) {
-                    digitalWrite(CC1101_GDO0, (beepTicks[i] > 0) ? HIGH : LOW);
-
-                    uint32_t start = micros();
-                    uint32_t target = ticksOf(beepTicks[i]) * baseTickUs;
-                    while (micros() - start < target);
-                }
-            }
-        }
-
-        digitalWrite(CC1101_GDO0, LOW);
+// Hands one beep to the RMT and returns. A press arriving while a beep is already
+// on the air is ignored, not queued: the device emits one precise beep per press.
+bool startTransmit() {
+    if (txActive || rmt_beep::is_busy()) {
+        Serial.println(F("busy - trigger ignored"));
+        return false;
     }
 
-    // Resume normal system operations
-    xTaskResumeAll();
-}
-
-void triggerTransmit() {
     setLEDColor(0, 0, 255); // Blue
 
     int state = radio.transmitDirect(); // Enter transparent mode
@@ -208,54 +116,63 @@ void triggerTransmit() {
         setLEDColor(255, 0, 0);
         delay(500);
         clearLED();
+        return false;
+    }
+
+    delay(5); // Let the frequency synthesiser settle before the first edge
+
+    if (!rmt_beep::start()) {
+        Serial.println(F("ERR rmt_beep::start failed"));
+        radio.standby();
+        setLEDColor(255, 0, 0);
+        delay(500);
+        clearLED();
+        return false;
+    }
+
+    txActive = true;
+    return true;
+}
+
+// Called from loop(). The RMT clears its busy flag from the loop-end interrupt;
+// putting the radio back to standby is SPI work and has to happen in task context.
+void pollTransmit() {
+    if (!txActive || rmt_beep::is_busy()) {
         return;
     }
 
-    if (timingMode == 1) {
-        delay(5); // Let the frequency synthesiser settle before the first edge
-    }
-
-    transmitSequence();
-
-    state = radio.standby(); // Back to sleep
+    int state = radio.standby();
     if (state != RADIOLIB_ERR_NONE) {
         Serial.print(F("ERR standby failed, code: "));
         Serial.println(state);
     }
 
+    txActive = false;
     clearLED();
+
+    // Restart the heartbeat cycle rather than letting a pulse fire the instant the
+    // beep ends: the beep outlasts HEARTBEAT_PERIOD_MS, so the timer is always
+    // overdue by the time the transmission finishes.
+    heartbeatLit = false;
+    lastHeartbeatMs = millis();
+
+    Serial.println(F("TX done"));
 }
 
 // --- Serial calibration interface ---
 void printState() {
     Serial.println(F("--- calibration state ---"));
-    Serial.print(F("  k  base tick us  : ")); Serial.println(baseTickUs);
-    Serial.print(F("  p  power dBm     : ")); Serial.println(outputPower);
-    Serial.print(F("  b  frames/burst  : ")); Serial.println(framesPerBurst);
-    Serial.print(F("  r  bursts        : ")); Serial.println(repeatCount);
-    Serial.print(F("  g  inter-burst us: ")); Serial.println(gapUs);
-    Serial.print(F("  f  carrier MHz   : ")); Serial.println(carrierMHz, 3);
-    Serial.print(F("  m  timing mode   : "));
-    Serial.println(timingMode == 1 ? F("1 (deadline + settle)") : F("0 (legacy)"));
-    Serial.print(F("     payload edges : ")); Serial.println(payloadSize);
-    Serial.print(F("     frame us      : ")); Serial.println(frameDurationUs());
-    Serial.print(F("     burst us      : ")); Serial.println(burstDurationUs());
-    Serial.print(F("     sequence us   : ")); Serial.println(sequenceDurationUs());
+    Serial.print(F("  k  symbol ticks   : ")); Serial.print(rmt_beep::symbol_ticks);
+    Serial.print(F(" (")); Serial.print(rmt_beep::symbol_period_ns());
+    Serial.println(F(" ns)"));
+    Serial.print(F("  d  beep ms        : ")); Serial.println(rmt_beep::beep_duration_ms);
+    Serial.print(F("  p  power dBm      : ")); Serial.println(outputPower);
+    Serial.print(F("  f  carrier MHz    : ")); Serial.println(carrierMHz, 3);
+    Serial.print(F("     runs per frame : ")); Serial.println(rmt_beep::kRunCount);
+    Serial.print(F("     frame us       : ")); Serial.println(rmt_beep::frame_duration_us());
+    Serial.print(F("     frames         : ")); Serial.println(rmt_beep::frame_count());
+    Serial.print(F("     actual beep us : ")); Serial.println(rmt_beep::beep_duration_actual_us());
     Serial.println(F("  t  transmit once     ?  this help"));
-}
-
-// Rejects a change that would push the burst past the watchdog budget.
-bool budgetOk() {
-    uint32_t d = sequenceDurationUs();
-    if (d <= WATCHDOG_BUDGET_US) {
-        return true;
-    }
-    Serial.print(F("ERR rejected: sequence would be "));
-    Serial.print(d / 1000);
-    Serial.print(F(" ms, budget is "));
-    Serial.print(WATCHDOG_BUDGET_US / 1000);
-    Serial.println(F(" ms (task watchdog)"));
-    return false;
 }
 
 void executeCommand(const char *cmd) {
@@ -264,19 +181,27 @@ void executeCommand(const char *cmd) {
 
     switch (cmd[0]) {
         case 'k': {
-            uint32_t prev = baseTickUs;
+            // Symbol period sweep, in RMT channel ticks per symbol. One step is
+            // 1/SYMBOL_TICKS of the period, about 1.28% at the default of 78.
             uint32_t v = strtoul(arg, nullptr, 10);
-            if (v < 20 || v > 2000) {
-                Serial.println(F("ERR k out of range (20..2000)"));
+            if (!rmt_beep::set_symbol_ticks(v)) {
+                Serial.println(F("ERR k rejected (busy, or period/frame count out of range)"));
                 break;
             }
-            baseTickUs = v;
-            if (!budgetOk()) {
-                baseTickUs = prev;
+            Serial.print(F("OK symbol = ")); Serial.print(rmt_beep::symbol_period_ns());
+            Serial.print(F(" ns, frame = ")); Serial.print(rmt_beep::frame_duration_us());
+            Serial.print(F(" us, frames = ")); Serial.println(rmt_beep::frame_count());
+            break;
+        }
+        case 'd': {
+            uint32_t v = strtoul(arg, nullptr, 10);
+            if (!rmt_beep::set_duration_ms(v)) {
+                Serial.println(F("ERR d rejected (busy, or over 1023 frames in one batch)"));
                 break;
             }
-            Serial.print(F("OK base tick = ")); Serial.print(baseTickUs);
-            Serial.print(F(" us, frame = ")); Serial.print(frameDurationUs());
+            Serial.print(F("OK beep = ")); Serial.print(rmt_beep::beep_duration_ms);
+            Serial.print(F(" ms, frames = ")); Serial.print(rmt_beep::frame_count());
+            Serial.print(F(", actual = ")); Serial.print(rmt_beep::beep_duration_actual_us());
             Serial.println(F(" us"));
             break;
         }
@@ -291,56 +216,6 @@ void executeCommand(const char *cmd) {
             Serial.print(F("OK power = ")); Serial.println(outputPower);
             break;
         }
-        case 'b': {
-            // The sweep that matters most: how many contiguous frames the collar
-            // needs before it acts. 1 = one frame then a gap (known dead), 7 = a
-            // real tap. Sweep upward from 1 to find the actual threshold.
-            uint16_t prev = framesPerBurst;
-            long v = atol(arg);
-            if (v < 1 || v > 1000) {
-                Serial.println(F("ERR b out of range (1..1000)"));
-                break;
-            }
-            framesPerBurst = (uint16_t)v;
-            if (!budgetOk()) {
-                framesPerBurst = prev;
-                break;
-            }
-            Serial.print(F("OK frames/burst = ")); Serial.print(framesPerBurst);
-            Serial.print(F(", burst = ")); Serial.print(burstDurationUs());
-            Serial.println(F(" us"));
-            break;
-        }
-        case 'r': {
-            uint16_t prev = repeatCount;
-            long v = atol(arg);
-            if (v < 1 || v > 10000) {
-                Serial.println(F("ERR r out of range (1..10000)"));
-                break;
-            }
-            repeatCount = (uint16_t)v;
-            if (!budgetOk()) {
-                repeatCount = prev;
-                break;
-            }
-            Serial.print(F("OK bursts = ")); Serial.println(repeatCount);
-            break;
-        }
-        case 'g': {
-            uint32_t prev = gapUs;
-            uint32_t v = strtoul(arg, nullptr, 10);
-            if (v > 100000) {
-                Serial.println(F("ERR g out of range (0..100000)"));
-                break;
-            }
-            gapUs = v;
-            if (!budgetOk()) {
-                gapUs = prev;
-                break;
-            }
-            Serial.print(F("OK gap = ")); Serial.println(gapUs);
-            break;
-        }
         case 'f': {
             float v = atof(arg);
             int state = radio.setFrequency(v);
@@ -352,20 +227,10 @@ void executeCommand(const char *cmd) {
             Serial.print(F("OK carrier = ")); Serial.println(carrierMHz, 3);
             break;
         }
-        case 'm': {
-            int v = atoi(arg);
-            if (v != 0 && v != 1) {
-                Serial.println(F("ERR m must be 0 (legacy) or 1 (deadline)"));
-                break;
-            }
-            timingMode = (uint8_t)v;
-            Serial.print(F("OK timing mode = ")); Serial.println(timingMode);
-            break;
-        }
         case 't':
-            Serial.println(F("TX ..."));
-            triggerTransmit();
-            Serial.println(F("TX done"));
+            if (startTransmit()) {
+                Serial.println(F("TX ..."));
+            }
             break;
         case '?':
             printState();
@@ -398,10 +263,6 @@ void pollSerial() {
 void setup() {
     Serial.begin(115200);
     delay(2000); // Give serial monitor time to connect
-
-    for (size_t i = 0; i < payloadSize; i++) {
-        tickSum += ticksOf(beepTicks[i]);
-    }
 
     // 1. Initialize RGB LED
     strip.begin();
@@ -450,8 +311,16 @@ void setup() {
         while (true);
     }
 
-    pinMode(CC1101_GDO0, OUTPUT);
-    digitalWrite(CC1101_GDO0, LOW);
+    // 5. Claim GDO0 for the RMT. Deliberately after strip.begin(): the LED is the
+    // other RMT client and both channels must agree on the group clock. Either
+    // order works because both ask for APB, and this one makes the shared-clock
+    // dependency visible rather than accidental.
+    esp_err_t err = rmt_beep::init();
+    if (err != ESP_OK) {
+        Serial.print(F("RMT init FAILED, esp_err: ")); Serial.println(err);
+        setLEDColor(255, 0, 0); // Red
+        while (true);
+    }
 
     Serial.println(F("System Ready. Press BOOT button or send 't' to transmit."));
     printState();
@@ -461,19 +330,12 @@ void loop() {
     pollSerial();
 
     if (buttonTriggered) {
+        buttonTriggered = false; // Reset the flag before acting, so a press during
+                                 // the beep is dropped rather than deferred.
         Serial.println(F("Button pressed! Transmitting..."));
-
-        triggerTransmit();
-
-        // Restart the heartbeat cycle rather than letting a pulse fire the instant
-        // the beep ends: the sequence outlasts HEARTBEAT_PERIOD_MS, so the timer
-        // is always overdue by the time triggerTransmit() returns.
-        heartbeatLit = false;
-        lastHeartbeatMs = millis();
-
-        buttonTriggered = false; // Reset the flag
-        Serial.println(F("Done. Waiting for next press."));
+        startTransmit();
     }
 
+    pollTransmit();
     pollHeartbeat();
 }

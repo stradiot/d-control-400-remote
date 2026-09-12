@@ -7,7 +7,7 @@ The repository contains everything needed to build one: firmware for two runtime
 ⚠️ **Scope and disclaimers**
 
 * **Undocumented protocol.** Dogtrace publishes nothing about the link. Everything here was measured from SDR captures. The frame has since been decoded far enough to describe its structure — see [What the frame looks like](#-what-the-frame-looks-like) — but the firmware **does not use that decode**. It still replays a stored payload verbatim.
-* **Raw replay, not synthesis.** The transmitted signal is a fixed-code payload captured with an SDR, cleaned up and re-emitted as raw timings, bit-banged onto the CC1101's GDO0 pin in asynchronous direct mode: no packet engine, no sync word, no CRC. The encoding is **run-length** — all the information is in the durations and none in the levels. It is *not* PWM, despite what earlier revisions of this file claimed: PWM would need exactly half the runs long, and a real frame has 21 long runs out of 88.
+* **Raw replay, not synthesis.** The transmitted signal is a fixed-code payload captured with an SDR, cleaned up and re-emitted as raw timings, clocked onto the CC1101's GDO0 pin by the ESP32-C3's RMT peripheral in asynchronous direct mode: no packet engine, no sync word, no CRC. The encoding is **run-length** — all the information is in the durations and none in the levels. It is *not* PWM, despite what earlier revisions of this file claimed: PWM would need exactly half the runs long, and a real frame has 21 long runs out of 88.
 * **Device specific.** The payload committed here was captured from one physical remote and is not a universal key for every d-control 400. The 68 runs that stay constant across everything that handset can send are *assumed* to be its identity — an assumption that has never been tested, because testing it needs a second remote. See [What the frame looks like](#-what-the-frame-looks-like). What this repository gives you is a structural template; you supply your own captured frame.
 * **A fresh clone does not compile.** `include/signal.h` in this repository is encrypted, so it is not valid C. Replace it with your own capture using the template in [Providing your own signal](#-providing-your-own-signal).
 * **Beep only.** The shock function is deliberately out of scope. As of the September 2026 decode that is a policy rather than a limitation: the frame is understood well enough to construct a shock command, and this repository deliberately does not carry what would be required to build one.
@@ -170,39 +170,40 @@ That is deliberate. In asynchronous mode the CC1101 samples the GDO0 pin on its 
 
 `RX_BANDWIDTH` looks like dead configuration, and it is not. The CC1101 derives its channel filter from a chain of dividers off the 26 MHz crystal, and the register selects which tap. 116.0 kHz picks a tap that divides cleanly, which keeps the internal clock tree — and therefore the shape of the transmitted bursts — stable. In OOK the synthesiser stays parked at 869.525 MHz regardless.
 
-### 3. Suspending the scheduler
+### 3. Clocking the waveform out of hardware
 
-The ESP32-C3 is a single-core RISC-V part running FreeRTOS, and any preemption in the middle of the waveform stretches a run by however long the other task took. The transmit loop therefore runs under `vTaskSuspendAll()`.
+The ESP32-C3 is a single-core RISC-V part running FreeRTOS, so a CPU-generated waveform is at the mercy of every other task: a preemption mid-frame stretches a run by however long the other task took. The firmware used to answer that with `vTaskSuspendAll()` around each burst. It worked, and it cost a great deal — the scheduler had to be released periodically or the task watchdog fired (a 159 ms burst followed by a 5 ms gap rebooted the ESPHome build with `ESP_RST_TASK_WDT`), and the release had to be brief or the beep audibly chopped.
 
-Two consequences are worth understanding rather than memorising:
+The waveform is now clocked out by the **RMT** peripheral — Remote Control Transceiver, built for exactly this class of signal and already driving the WS2812 status LED. The 88-run frame is packed into the channel's own memory as 44 words of two level-plus-duration entries each, and the hardware loops it for as many frames as the beep needs. The CPU's entire involvement is one `rmt_transmit()` call that returns immediately; the transmission ends in an interrupt.
 
-* **Suspending is not the same as disabling interrupts.** `vTaskSuspendAll()` defers context switches; the tick ISR still runs. That is why `micros()` keeps working across the suspended region — it reads the hardware systimer, not a FreeRTOS tick count — and why the 300 ms interrupt watchdog is not a concern even though a burst is longer than that.
-* **The task watchdog is fed by the idle task, which cannot run while the scheduler is suspended.** On the ESPHome path this bit for real: a 159 ms burst followed by a 5 ms gap rebooted the device with `ESP_RST_TASK_WDT`. The fix was calling `App.feed_wdt()` in every inter-burst gap, rather than trusting idle to be scheduled — Wi-Fi and lwIP sit far above idle in priority and can consume the whole gap servicing the backlog that built up during the burst.
+Three constraints disappear together: no scheduler suspension, no watchdog exposure, and no gap. A beep is one genuinely continuous transmission for its whole duration, which is what holding the original remote's button produces and what the bit-banged version could not do at all.
 
-The two firmware paths differ here on purpose. `esphome/cc1101.h` releases the scheduler between bursts so ESPHome can service the network. `src/main.cpp` holds it across the entire ~3 s sequence, which it can get away with because in this Arduino core's configuration the idle task is not subscribed to the task watchdog at all — nothing feeds it and nothing trips it. Neither path releases the scheduler *between frames*, and that is the point of the next section.
+What replaces them is a shorter list of facts about the peripheral, all of which are properties of the RMT group rather than of this firmware:
 
-`WATCHDOG_BUDGET_US` in the standalone firmware is therefore defensive rather than load-bearing: it stops a serial command from setting up a multi-second blocking transmit. Do not read a passing budget check as the reason that path survives.
+* **The clock source and the prescale belong to the group, not the channel.** The first channel created fixes both for every later one. On this board that first channel is normally the status LED, which asks for `RMT_CLK_SRC_DEFAULT` — APB on the C3 — so the radio channel asks for APB explicitly rather than relying on init order. A mismatch is a hard `ESP_ERR_INVALID_ARG`, "group clock conflict", not a silent fallback. Both firmware paths therefore run the same divider of 214, a channel tick of exactly 2.675 µs, and emit a bit-identical waveform.
+* **There are two TX-capable channels and 48 words of memory each.** The LED holds one, the radio the other, with nothing spare. Under ESPHome the LED must be pinned with `rmt_symbols: 48`, because the default on the C3 is 96 — two blocks — and a two-block channel claims its neighbour's, leaving the radio nowhere to go.
+* **The C3 has no loop auto-stop.** `SOC_RMT_SUPPORT_TX_LOOP_COUNT` is defined, `SOC_RMT_SUPPORT_TX_LOOP_AUTO_STOP` is not, so reaching the frame count raises an interrupt and the driver stops the channel from its own ISR. A few entries can still reach the air after the target, which truncates the last frame rather than dropping it — the same thing the real remote does when the button is released. GDO0's resting level is forced from a register (`eot_level`, which the driver also writes to `RMT_IDLE_OUT_LV`) rather than taken from the end marker, so even an abort mid-frame leaves the pin low and the carrier off.
 
-### 4. Burst structure — contiguity matters more than anything else
+### 4. Contiguity — the property that decides whether it works at all
 
 This is the single most important property of the transmission, and the least obvious.
 
-**Frames within a burst are emitted back-to-back with no silence between them.** The original remote never inserts a gap mid-transmission: a tap is 7 contiguous frames (~159 ms) and a ~4.1 s hold is ~180 contiguous frames, with no OFF period longer than two symbol periods anywhere inside either. Verified across three captures and 13 presses.
+**Frames are emitted back-to-back with no silence between them.** The original remote never inserts a gap mid-transmission: a tap is 7 contiguous frames (~159 ms) and a ~4.1 s hold is ~180 contiguous frames, with no OFF period longer than two symbol periods anywhere inside either. Verified across three captures and 13 presses.
 
 This is not a detail. A firmware build that sent **one** frame followed by a 5 ms gap produced **zero** beeps, while an earlier, badly mistimed payload that happened to pack about 2.5 frames into each burst worked around 70% of the time. Two receiver behaviours explain it, and both demand contiguity:
 
 * **Consecutive-frame validation** — cheap fixed-code decoders confirm a frame by requiring the next one to arrive and match before a timer expires. A gap expires that timer on every frame.
 * **AGC settling** — a few milliseconds without carrier lets the receiver's gain drift toward the noise floor, corrupting the start of the next frame, which is exactly where the preamble lives.
 
-The three knobs are layered and not independent:
+Under RMT contiguity is free rather than bought, so the three layered knobs the bit-banged firmware needed — contiguous frames per burst, silence between bursts, number of bursts — collapse into one:
 
 | Macro | Meaning | Bounded by |
 | :--- | :--- | :--- |
-| `FRAMES_PER_BURST` | Contiguous frames, **no gap between them** | The collar's decoder. 7 matches a real tap and is known-good |
-| `TRANSMIT_GAP_US` | Silence **between bursts only** | Audibility: 5 ms is inaudible, 30 ms audibly chops the beep |
-| `TRANSMIT_REPEAT` | Number of bursts, i.e. how long the beep lasts | The watchdog, on the ESPHome path |
+| `BEEP_DURATION_MS` | How long the beep lasts | The RMT loop counter: ten bits, so 1023 frames — about 23 s — in one batch |
 
-The collar tolerates more than contiguity within a burst: with the gap set to zero at runtime on the standalone path, 126 frames ran back-to-back over 2.87 s — the shape of a real button hold rather than a series of taps — and decoded 6/6. So the receiver does not need periodic silence to resettle. The gap exists to give the ESPHome path somewhere to feed the watchdog, not because the radio link wants it.
+The other two are gone because nothing in the protocol ever wanted them. Both existed only because the CPU cannot hold `vTaskSuspendAll()` indefinitely, so a long transmission had to be chopped into pieces with scheduler windows between them; the gap in particular was a ceiling on damage (5 ms inaudible, 30 ms audibly chopping) rather than a value with a right answer. The evidence that the receiver never needed them was already in hand before the migration: with the gap set to zero at runtime on the standalone path, 126 frames ran back-to-back over 2.87 s — the shape of a real button hold — and decoded 6/6.
+
+That the payload's run count is **even** is what makes the hardware loop legal, and it is a property of the frame rather than a convenience. Each RMT word holds two entries, so 88 runs is exactly 44 words with no half-filled tail; and because the frame starts ON and ends OFF, each repeat begins with a real OFF→ON edge instead of two same-level runs merging at the seam. The peripheral replays each entry's stored level bit verbatim and never enforces alternation, so an odd-length frame could not be looped out of a single block at all.
 
 
 ---
@@ -254,7 +255,7 @@ The 68 constant runs are *assumed* to be this handset's identity, and that assum
 
 Capture the signal from the remote you want to clone with an SDR in AM/ASK mode, extract the run lengths, and write them into the file below.
 
-The payload is stored as **run lengths in symbol periods**, not absolute microseconds. Every element is a whole number of `BASE_TICK_US` periods, so the entire frame is parameterised by that one number. Keep it that way — it is what allows the symbol period to be changed at runtime without re-deriving the payload.
+The payload is stored as **run lengths in symbol periods**, not absolute microseconds. Every element is a whole number of `SYMBOL_TICKS` RMT channel ticks, so the entire frame is parameterised by that one number. Keep it that way — it is what allows the symbol period to be swept at runtime without re-deriving the payload.
 
 ```cpp
 #pragma once
@@ -263,21 +264,32 @@ The payload is stored as **run lengths in symbol periods**, not absolute microse
 #define OUTPUT_POWER 10           // CC1101 transmit power in dBm
 #define BIT_RATE 100.0            // Async oversampling rate in kbps
 #define RX_BANDWIDTH 116.0        // Receiver filter bandwidth in kHz
-#define FRAMES_PER_BURST 7        // Contiguous frames per burst, with NO gap between them
-#define TRANSMIT_REPEAT 18        // Bursts per trigger (also sets beep duration)
-#define TRANSMIT_GAP_US 5000      // PA-off gap between BURSTS only, never between frames
 
-#define BASE_TICK_US 209          // Symbol period; every run length is a multiple of this
+#define BEEP_DURATION_MS 3000     // How long the collar beeps. The firmware rounds this
+                                  // to a whole number of frames and loads that into the
+                                  // RMT loop counter, which tops out at 1023 (~23 s).
 
-// Replace the numbers below with your captured run lengths, in BASE_TICK_US units.
+#define SYMBOL_TICKS 78           // Symbol period, in RMT channel ticks
+#define RMT_RESOLUTION_HZ 373832  // Requested channel tick rate. The driver rounds to the
+                                  // nearest integer divider -- 214 off an 80 MHz group
+                                  // clock, a 2.675 us tick, so T = 78 x 2.675 = 208.65 us.
+
+// Replace the numbers below with your captured run lengths, in symbol periods.
 // Positive = RF ON (GDO0 HIGH), negative = RF OFF.
-// Absolute duration of element i is BASE_TICK_US * abs(SIGNAL_BEEP_TICKS[i]).
+// Absolute duration of element i is T * abs(SIGNAL_BEEP_TICKS[i]).
 #define SIGNAL_BEEP_TICKS { \
   1, -1, 2, -2, 1, -1, ... \
 }
 ```
 
-> **Note:** Keep every macro above. Both firmware paths require all of them and neither will compile without them. See [Burst structure](#4-burst-structure--contiguity-matters-more-than-anything-else) for what `FRAMES_PER_BURST`, `TRANSMIT_REPEAT` and `TRANSMIT_GAP_US` do, and why the difference between "between frames" and "between bursts" is the difference between working and not working at all.
+> **Note:** Keep every macro above. Both firmware paths require all of them and neither will compile without them.
+
+Two properties of `SIGNAL_BEEP_TICKS` are checked at compile time, because the RMT cannot loop a frame that violates either:
+>
+> * **An even number of runs.** Each RMT word holds two entries, and the peripheral replays each entry's stored level bit verbatim rather than enforcing alternation, so an odd-length frame would put two same-level runs against each other at the loop seam and merge them.
+> * **At most 94 runs.** That is 47 words, leaving room for the one word the driver appends as the end marker inside a 48-word channel block. Loop mode cannot refill the block as it plays, so the whole frame has to be resident.
+>
+> If your remote's frame is longer than 94 runs, the RMT path cannot loop it out of one block and the design needs revisiting rather than a bigger constant.
 
 ### Getting the numbers out of a capture
 
@@ -293,7 +305,7 @@ Two capture-side traps are worth naming, because both cost a session here:
 
 ### Measuring the symbol period
 
-Everything else falls out of `BASE_TICK_US`, so it is the one number to measure rather than estimate. **Take it frame-start to frame-start**: the rising edge that opens one frame against the rising edge that opens a frame several repeats later, divided by the number of symbol periods between them. Here that was 272 910 samples across exactly 654 periods at 2.000 MSps — 417.294 samples per period, or **208.647 µs**, with the six intermediate estimates agreeing to within 0.02%.
+Everything else falls out of the symbol period, so it is the one number to measure rather than estimate. **Take it frame-start to frame-start**: the rising edge that opens one frame against the rising edge that opens a frame several repeats later, divided by the number of symbol periods between them. Here that was 272 910 samples across exactly 654 periods at 2.000 MSps — 417.294 samples per period, or **208.647 µs**, with the six intermediate estimates agreeing to within 0.02%.
 
 Two properties of that baseline are what make it trustworthy, and both are about the endpoints rather than the span:
 
@@ -378,21 +390,18 @@ The standalone firmware exposes its RF parameters over the serial monitor (11520
 
 | Command | Effect |
 | :--- | :--- |
-| `k <us>` | Symbol period (`BASE_TICK_US`) |
+| `k <ticks>` | Symbol period, in RMT channel ticks (`SYMBOL_TICKS`; 78 = 208.65 µs, one step is 1.28%) |
+| `d <ms>` | Beep duration |
 | `p <dBm>` | Output power |
-| `b <n>` | Contiguous frames per burst |
-| `r <n>` | Number of bursts per trigger |
-| `g <us>` | Gap **between bursts** (0 is legal on this path) |
 | `f <MHz>` | Carrier frequency |
-| `m <0\|1>` | Timing engine: `0` legacy per-edge, `1` absolute-deadline plus synthesiser settle (default) |
-| `t` | Transmit one full sequence — all `r` bursts |
-| `?` | Print current state and computed frame / burst / sequence durations |
+| `t` | Transmit one beep |
+| `?` | Print current state and the computed frame duration, frame count and beep length |
 
 It exists so that a new capture can be brought in without a reflash between trials, which is the situation these parameters are actually uncertain in. The values committed here are already settled, so nothing needs sweeping on a working build.
 
-When bringing up your own signal, the useful diagnostic is that the two common faults look different: a wrong symbol period produces *intermittent* triggering, a wrong burst structure produces *none at all*. If the collar never responds, check `FRAMES_PER_BURST` and where the gap sits before touching the timebase — no amount of sweeping will find that fault.
+When bringing up your own signal, the useful diagnostic is that the two common faults look different: a wrong symbol period produces *intermittent* triggering, a wrong frame structure produces *none at all*. If the collar never responds, check the payload and the run count before touching the timebase — no amount of sweeping will find that fault.
 
-> **Safety:** the transmit sequence runs with the FreeRTOS scheduler suspended. Any `k`, `b`, `r` or `g` change that would push the sequence past ~4 s is rejected and the previous value kept, so the console cannot set up a multi-second blocking transmit.
+`k` and `d` are refused while a beep is in flight, and either is refused if the result would not fit the hardware: a symbol period whose long run overflows the RMT's 15-bit duration field, or a beep longer than one 1023-frame batch.
 
 ---
 
@@ -448,13 +457,11 @@ Wi-Fi transmit power is capped at 8.5 dBm in the YAML. That is a hardware fix fo
 
 ## 🧭 Possible future improvements
 
-### Move transmission from the CPU to the RMT peripheral
+### Measure what the loop seam costs
 
-Today the waveform is bit-banged from the CPU with the scheduler suspended, and every awkward constraint in this project descends from that one fact: frames must be contiguous, the CPU must be released periodically or the watchdog fires, and the release must be brief or the beep audibly chops. Three requirements, one knob.
+Continuous TX mode restarts from the first entry when it meets the end marker, and the reference manual says only that the transmitter "starts transmitting the first data again" — it does not say whether the jump back adds any output time. Any plausible answer is small, and a decode cannot see it: the decoder rounds every run to one or two symbol periods, so a final run stretched by anything under half a symbol (104 µs, 39 channel ticks) reads identically to a perfect seam.
 
-The ESP32-C3's **RMT** peripheral — Remote Control Transceiver, built for exactly this class of signal, and already used here to drive the WS2812 status LED — clocks a pulse train out of a buffer in hardware with no CPU involvement. That removes all three constraints at once: no `vTaskSuspendAll()`, no inter-burst gap, no watchdog exposure, and timing that Wi-Fi activity cannot perturb. It would also permit a genuinely continuous transmission for the full beep duration, exactly like holding the original remote's button.
-
-Two things are already known. The frame fits: an RMT symbol packs two level-plus-duration entries, so 88 runs is **44 symbols** against a 48-symbol channel block. And the collar accepts continuous drive — 126 back-to-back frames over 2.87 s decoded 6/6 with the inter-burst gap set to zero — so the approach is not blocked on receiver behaviour. The open question is whether the C3 supports hardware TX looping, or whether continuous output needs a wrap-around refill interrupt on the half-buffer threshold.
+The measurement that can see it is the one the symbol period came from — frame start to frame start, rising edge to rising edge at the same structural position — comparing a span that crosses a seam against one that does not. A rate error and a per-seam stretch both add a constant per frame, which is why the two spans are needed rather than one. It is a fact about the chip worth having for anything that later loops RMT output, and it changes nothing about whether this device works.
 
 ---
 
