@@ -7,6 +7,8 @@ esphome:
     - cc1101.h
     - ../include/pinout.h
     - ../include/signal.h
+    - ../include/cc1101_config.h
+    - ../include/reset_reason.h
     - ../include/rmt_beep.h
   libraries:
     - SPI
@@ -23,7 +25,7 @@ esphome:
       # 1. Immediately turn the LED Solid Red to indicate boot-up
       - light.turn_on:
           id: status_led
-          brightness: 50%
+          brightness: 20%
           red: 1.0
           green: 0.0
           blue: 0.0
@@ -71,7 +73,7 @@ wifi:
           # SUCCESS: Both Wi-Fi and Radio are good! Flash Green, then turn off.
           - light.turn_on:
               id: status_led
-              brightness: 50%
+              brightness: 20%
               red: 0.0
               green: 1.0
               blue: 0.0
@@ -81,7 +83,7 @@ wifi:
           # HARDWARE FAILURE: Radio failed to init. Lock the LED to Solid Red.
           - light.turn_on:
               id: status_led
-              brightness: 50%
+              brightness: 20%
               red: 1.0
               green: 0.0
               blue: 0.0
@@ -104,6 +106,23 @@ light:
     # claims its neighbour's. The C3 has exactly two TX-capable channels, so at 96
     # the LED consumes both and rmt_beep::init() has nowhere to go.
     rmt_symbols: 48
+    # Gamma correction OFF, deliberately, and this line is the single reason every
+    # brightness below is the number it is. ESPHome defaults to 2.8, which exists to
+    # make a DIMMING SWEEP look perceptually smooth -- this LED shows three fixed
+    # colours and never sweeps, so the curve buys nothing and costs the entire
+    # bottom of the range: it is what made a 15% two-channel pulse emit (1, 0, 0)
+    # with the green channel quantised to zero. At 1.0 the channel value is a linear
+    # duty cycle, a brightness percentage is very nearly the emitted 0-255 fraction,
+    # and a colour ratio survives at any brightness instead of being crushed. It
+    # also makes this file directly comparable with the standalone path, whose
+    # Adafruit_NeoPixel applies no curve at all.
+    gamma_correct: 1.0
+    # Every brightness in this file is a level from include/led_policy.h expressed
+    # as a percentage: 20% emits 51/255 and 9% emits 23/255, against that header's
+    # LED_LEVEL_SOLID 50 and LED_LEVEL_PULSE 23. They are literals rather than
+    # lambdas on purpose -- see the header for why the one value that would most
+    # benefit from being shared, the heartbeat period, is the one ESPHome refuses
+    # to template.
     # Disable ESPHome's default 1-second fade animation for instant response
     default_transition_length: 0s
     internal: true
@@ -132,24 +151,34 @@ interval:
               - not:
                   script.is_running: transmit_beep
           then:
+            # 9% emits 23/255, which is LED_LEVEL_PULSE in include/led_policy.h
+            # and exactly what the standalone heartbeat emits. The amber is then
+            # (23, 16) -- green 0.70 against red, LED_AMBER_GREEN_RATIO.
+            #
+            # This pulse used to be brightness 15% under the inherited gamma 2.8,
+            # and it emitted (1, 0, 0): pure red at one count out of 255, the green
+            # channel quantised away before it reached the LED. So the Wi-Fi-down
+            # state was never once distinguishable from the Wi-Fi-up one, and the
+            # config said amber while the hardware said red. The 0.70 ratio only
+            # survives because gamma is off: under a 2.8 curve it would emit 0.35.
             - if:
                 condition: wifi.connected
                 then:
                   - light.turn_on:
                       id: status_led
-                      brightness: 15%
+                      brightness: 9%
                       red: 0.0
                       green: 1.0
                       blue: 0.0
                 else:
                   - light.turn_on:
                       id: status_led
-                      brightness: 15%
+                      brightness: 9%
                       red: 1.0
-                      green: 0.35
+                      green: 0.70
                       blue: 0.0
-            # Short and dim: this repeats forever, unlike the one-off boot flash.
-            - delay: 80ms
+            # Brief on purpose: this repeats forever, unlike the one-off boot flash.
+            - delay: 150ms
             # Re-check before clearing. A trigger that arrived during the pulse has
             # already set the LED blue, and an unconditional turn_off here would
             # blank it for the whole ~3 s transmission. Guarding only the start of
@@ -174,20 +203,7 @@ script:
     mode: single
     then:
       - lambda: |-
-          const char *why;
-          switch (esp_reset_reason()) {
-            case ESP_RST_POWERON:   why = "POWERON (normal cold boot)"; break;
-            case ESP_RST_SW:        why = "SW (esp_restart, e.g. OTA)"; break;
-            case ESP_RST_PANIC:     why = "PANIC (exception / abort)"; break;
-            case ESP_RST_INT_WDT:   why = "INT_WDT (interrupt watchdog)"; break;
-            case ESP_RST_TASK_WDT:  why = "TASK_WDT (task watchdog)"; break;
-            case ESP_RST_WDT:       why = "WDT (other watchdog)"; break;
-            case ESP_RST_BROWNOUT:  why = "BROWNOUT (supply rail sagged)"; break;
-            case ESP_RST_EXT:       why = "EXT (reset pin)"; break;
-            case ESP_RST_DEEPSLEEP: why = "DEEPSLEEP"; break;
-            default:                why = "UNKNOWN"; break;
-          }
-          ESP_LOGW("boot", "last reset reason: %s", why);
+          ESP_LOGW("boot", "last reset reason: %s", reset_reason::describe());
 
   # Script to transmit the beep.
   #
@@ -205,22 +221,28 @@ script:
           condition:
             lambda: 'return cc1101_ctrl::is_ready();'
           then:
-            # 1. Turn LED Blue to indicate transmission
+            # 1. Turn LED Blue to indicate transmission. No yield is needed after
+            #    this, and one used to be: ESPHome's light component writes the LED
+            #    from a main-loop pass rather than inline, and the bit-banged
+            #    transmit took the main loop away for the whole burst under
+            #    vTaskSuspendAll(), so without a 500ms delay here the blue did not
+            #    appear until after the beep. Step 2 now returns in ~5ms and step 3
+            #    is an async wait that yields continuously, so the write lands
+            #    within one loop iteration. Re-adding a delay here buys nothing and
+            #    costs exactly that much latency between the press and the air.
             - light.turn_on:
                 id: status_led
-                brightness: 80%
+                brightness: 20%
                 red: 0.0
                 green: 0.0
                 blue: 1.0
-            # 2. Yield 500ms so ESPHome can physically push the Blue color to the LED
-            - delay: 500ms
-            # 3. Hand the frame to the RMT. This returns immediately; the peripheral
+            # 2. Hand the frame to the RMT. This returns immediately; the peripheral
             #    clocks the whole beep out of its own memory with no CPU involvement.
             - lambda: |-
                 if (!cc1101_ctrl::begin_transmission()) {
                   ESP_LOGE("cc1101", "Beep signal transmission failed!");
                 }
-            # 4. Wait for the hardware rather than for a fixed delay, so the script
+            # 3. Wait for the hardware rather than for a fixed delay, so the script
             #    stays running (and mode: single keeps holding off retriggers) for
             #    exactly as long as the beep lasts. The timeout is a backstop: if the
             #    loop-end interrupt never arrives the script must still finish and
@@ -229,16 +251,16 @@ script:
                 condition:
                   lambda: 'return !cc1101_ctrl::is_transmitting();'
                 timeout: 30s
-            # 5. Radio back to standby. SPI work, so it cannot happen in the RMT's
+            # 4. Radio back to standby. SPI work, so it cannot happen in the RMT's
             #    completion interrupt and has to be done here.
             - lambda: 'cc1101_ctrl::end_transmission();'
-            # 6. Turn LED off when finished
+            # 5. Turn LED off when finished
             - light.turn_off: status_led
           else:
             - logger.log:
                 level: ERROR
                 format: "Cannot transmit: CC1101 Radio is not initialized!"
-      # 7. Reset the switch back to OFF in Home Assistant only after everything is done
+      # 6. Reset the switch back to OFF in Home Assistant only after everything is done
       - switch.template.publish:
           id: beep_switch
           state: OFF

@@ -5,6 +5,9 @@
 
 #include "signal.h"
 #include "pinout.h"
+#include "led_policy.h"
+#include "cc1101_config.h"
+#include "reset_reason.h"
 #include "rmt_beep.h"
 
 SPIClass customSPI(FSPI);
@@ -35,10 +38,13 @@ constexpr unsigned long debounceDelay = 200;
 // dead or unpowered. A brief green pulse every HEARTBEAT_PERIOD_MS makes "alive
 // and radio OK" visible at a glance. Short and dim on purpose: this repeats
 // forever, so it must not be a nuisance in a room.
-// Green is scaled by strip.setBrightness(LED_BRIGHTNESS) on top of this value.
-constexpr unsigned long HEARTBEAT_PERIOD_MS = 5000;
-constexpr unsigned long HEARTBEAT_ON_MS = 80;
-constexpr uint8_t HEARTBEAT_GREEN = 120;
+// Levels come from include/led_policy.h and are written to the strip verbatim --
+// see the setBrightness(255) note in setup(). Adafruit applies no gamma curve and
+// the ESPHome path now disables its own, so an emitted level means the same light
+// on both paths and the two can be compared on the bench.
+constexpr unsigned long HEARTBEAT_PERIOD_MS = LED_PULSE_PERIOD_MS;
+constexpr unsigned long HEARTBEAT_ON_MS = LED_PULSE_MS;
+constexpr uint8_t HEARTBEAT_GREEN = LED_LEVEL_PULSE;
 unsigned long lastHeartbeatMs = 0;
 bool heartbeatLit = false;
 
@@ -107,13 +113,13 @@ bool startTransmit() {
         return false;
     }
 
-    setLEDColor(0, 0, 255); // Blue
+    setLEDColor(0, 0, LED_LEVEL_SOLID); // Blue
 
     int state = radio.transmitDirect(); // Enter transparent mode
     if (state != RADIOLIB_ERR_NONE) {
         Serial.print(F("ERR transmitDirect failed, code: "));
         Serial.println(state);
-        setLEDColor(255, 0, 0);
+        setLEDColor(LED_LEVEL_SOLID, 0, 0);
         delay(500);
         clearLED();
         return false;
@@ -124,7 +130,7 @@ bool startTransmit() {
     if (!rmt_beep::start()) {
         Serial.println(F("ERR rmt_beep::start failed"));
         radio.standby();
-        setLEDColor(255, 0, 0);
+        setLEDColor(LED_LEVEL_SOLID, 0, 0);
         delay(500);
         clearLED();
         return false;
@@ -264,9 +270,20 @@ void setup() {
     Serial.begin(115200);
     delay(2000); // Give serial monitor time to connect
 
+    // Why the chip last reset. Shared with the ESPHome path -- a brownout and a
+    // watchdog reset are indistinguishable from outside the board and have
+    // opposite fixes. This is the development path, so it gets the diagnostic too.
+    Serial.print(F("last reset reason: "));
+    Serial.println(reset_reason::describe());
+
     // 1. Initialize RGB LED
     strip.begin();
-    strip.setBrightness(LED_BRIGHTNESS);
+    // 255 disables Adafruit's global scaling entirely rather than setting it to
+    // maximum: setBrightness() stores b + 1 in a uint8_t, so 255 rolls over to 0,
+    // and show() skips the scaling pass when the stored value is 0. Colour
+    // components are then written literally, which is what lets led_policy.h state
+    // emitted levels instead of a level and a scale that have to be multiplied out.
+    strip.setBrightness(255);
     clearLED();
 
     // 2. Configure Button and attach Interrupt
@@ -280,7 +297,7 @@ void setup() {
     if (state == RADIOLIB_ERR_NONE) {
         Serial.println(F("CC1101 radio initialized successfully!"));
         // Flash Green to indicate radio is ready
-        setLEDColor(0, 255, 0); // Green
+        setLEDColor(0, LED_LEVEL_SOLID, 0); // Green
 
         delay(500);
 
@@ -289,25 +306,20 @@ void setup() {
         Serial.print(F("CC1101 radio initialization failed, code: "));
         Serial.println(state);
         // Flash Red if radio fails to initialize
-        setLEDColor(255, 0, 0); // Red
+        setLEDColor(LED_LEVEL_SOLID, 0, 0); // Red
 
         while (true);
     }
 
-    // 4. Configure CC1101 settings for Dogtrace
-    // Every return code is checked: a silently rejected setting would otherwise
-    // look identical to a bad capture during a calibration sweep.
-    bool ok = true;
-    ok = ok && (radio.setFrequency(carrierMHz) == RADIOLIB_ERR_NONE);
-    ok = ok && (radio.setOutputPower(outputPower) == RADIOLIB_ERR_NONE);
-    ok = ok && (radio.setBitRate(BIT_RATE) == RADIOLIB_ERR_NONE);
-    ok = ok && (radio.setRxBandwidth(RX_BANDWIDTH) == RADIOLIB_ERR_NONE);
-    ok = ok && (radio.setOOK(true) == RADIOLIB_ERR_NONE);
-    ok = ok && (radio.standby() == RADIOLIB_ERR_NONE);
+    // 4. Configure CC1101 settings for Dogtrace. Shared with the ESPHome path --
+    // see include/cc1101_config.h. The runtime carrier and power are passed in
+    // rather than defaulted, so a reset restores the captured values but a sweep
+    // set over serial survives a re-apply.
+    bool ok = cc1101_config::apply(radio, carrierMHz, outputPower);
 
     if (!ok) {
         Serial.println(F("CC1101 parameter configuration FAILED - readings will be unreliable"));
-        setLEDColor(255, 0, 0); // Red
+        setLEDColor(LED_LEVEL_SOLID, 0, 0); // Red
         while (true);
     }
 
@@ -318,7 +330,7 @@ void setup() {
     esp_err_t err = rmt_beep::init();
     if (err != ESP_OK) {
         Serial.print(F("RMT init FAILED, esp_err: ")); Serial.println(err);
-        setLEDColor(255, 0, 0); // Red
+        setLEDColor(LED_LEVEL_SOLID, 0, 0); // Red
         while (true);
     }
 

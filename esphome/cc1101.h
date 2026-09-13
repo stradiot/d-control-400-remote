@@ -13,6 +13,8 @@
 #include "esphome.h"
 #include "signal.h"
 #include "pinout.h"
+#include "cc1101_config.h"
+#include "reset_reason.h"
 #include "rmt_beep.h"
 
 #define delay(x) esphome::delay(x)
@@ -60,13 +62,10 @@ namespace cc1101_ctrl {
             ESP_LOGI("CC1101", "Radio initialized successfully!");
             // Use && to short-circuit if any of these fail
 
-            bool config_ok = true;
-            config_ok = config_ok && (radio->setFrequency(CARRIER_FREQUENCY) == RADIOLIB_ERR_NONE);
-            config_ok = config_ok && (radio->setOutputPower(OUTPUT_POWER) == RADIOLIB_ERR_NONE);
-            config_ok = config_ok && (radio->setBitRate(BIT_RATE) == RADIOLIB_ERR_NONE);
-            config_ok = config_ok && (radio->setRxBandwidth(RX_BANDWIDTH) == RADIOLIB_ERR_NONE);
-            config_ok = config_ok && (radio->setOOK(true) == RADIOLIB_ERR_NONE);
-            config_ok = config_ok && (radio->standby() == RADIOLIB_ERR_NONE);
+            // Shared with the standalone path -- see include/cc1101_config.h.
+            // Carrier and power default to the captured values; only the standalone
+            // path's serial sweep passes anything else.
+            bool config_ok = cc1101_config::apply(*radio);
 
             if (!config_ok) {
                 ESP_LOGE("CC1101", "Failed to configure radio parameters");

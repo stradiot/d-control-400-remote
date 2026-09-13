@@ -19,11 +19,13 @@ Two runtimes, but since the RMT migration the radio logic itself is **not** dupl
 | Standalone PlatformIO | `src/main.cpp` | Arduino, button-only, no network |
 | ESPHome / Home Assistant | `esphome/d-control-400.yaml` + `esphome/cc1101.h` | ESPHome, exposes a template switch |
 
-Both include `include/pinout.h`, `include/signal.h` and `include/rmt_beep.h`. See `esphome/CLAUDE.md` for ESPHome-specific detail.
+Both include `include/pinout.h`, `include/signal.h`, `include/cc1101_config.h`, `include/reset_reason.h` and `include/rmt_beep.h`. See `esphome/CLAUDE.md` for ESPHome-specific detail.
 
 `include/rmt_beep.h` is the transmission core and is shared verbatim: it packs the payload into RMT words, creates the channel, starts a looped transmission and reports when it ends. It talks only to the ESP-IDF RMT driver and `signal.h` — no Arduino, no ESPHome, no logging, failures reported by return value — so each path can log in its own idiom. **A change to RF behaviour belongs there, once, not in both paths.**
 
-What the paths still own separately is everything around a transmission: RadioLib setup, LED policy, the trigger surface (button and serial vs. button and a Home Assistant switch), and putting the radio back to standby when the hardware reports it is done. The bit-banged era's intentional differences — who suspends the scheduler and for how long, who feeds the watchdog, which timing engine is used — are all gone, because none of them have anything left to describe. Both paths now pass `RADIOLIB_NC` as RadioLib's GPIO argument: GDO0 belongs to the RMT and RadioLib must never touch it.
+`include/cc1101_config.h` holds the six RadioLib calls that are the radio's whole RF personality — frequency, power, bit rate, RX bandwidth, OOK, standby. They were duplicated verbatim in both paths, which is the one duplication here a compiler cannot catch: changed in a single path, it yields two firmwares that both build, both transmit, and differ only at range. Carrier and power are parameters defaulting to the `signal.h` values, so the standalone path's serial sweep (`f`, `p`) still works. `include/reset_reason.h` turns `esp_reset_reason()` into a string for both paths.
+
+What the paths still own separately is everything around a transmission: LED policy, the trigger surface (button and serial vs. button and a Home Assistant switch), and putting the radio back to standby when the hardware reports it is done. The bit-banged era's intentional differences — who suspends the scheduler and for how long, who feeds the watchdog, which timing engine is used — are all gone, because none of them have anything left to describe. Both paths now pass `RADIOLIB_NC` as RadioLib's GPIO argument: GDO0 belongs to the RMT and RadioLib must never touch it.
 
 Both trigger paths are **ignore-while-busy**. A press arriving during a beep is dropped, not queued or restarted: the device emits one precise beep per press and deliberately does not reproduce the original remote's press-and-hold behaviour. `rmt_beep::start()` enforces this on its own, so the ESPHome script's `mode: single` and the standalone `txActive` flag are belt-and-braces rather than the only guard.
 
@@ -340,8 +342,29 @@ Wi-Fi `output_power: 8.5dBm` in the YAML is a hardware fix for LDO brownout on t
 
 ## LED status convention
 
-Standalone: green 0.5 s at boot = radio OK · **green pulse 80 ms / 5 s = alive heartbeat** · solid red = init failed (halts) · blue = transmitting · off = no power or crashed.
-ESPHome: red = booting or init failed · green flash = Wi-Fi + radio ready · **green pulse 80 ms / 5 s = alive, Wi-Fi up** · **amber pulse 80 ms / 5 s = alive, Wi-Fi down** · blue = transmitting.
+Standalone: green 0.5 s at boot = radio OK · **green pulse 150 ms / 5 s = alive heartbeat** · solid red = init failed (halts) · blue = transmitting · off = no power or crashed.
+ESPHome: red = booting or init failed · green flash = Wi-Fi + radio ready · **green pulse 150 ms / 5 s = alive, Wi-Fi up** · **amber pulse 150 ms / 5 s = alive, Wi-Fi down** · blue = transmitting.
+
+The palette lives in `include/led_policy.h` as levels **emitted** by the WS2812,
+0-255: `LED_LEVEL_SOLID` 50 for the one-off states, `LED_LEVEL_PULSE` 23 for the
+heartbeat. Emitted levels are the only unit the two paths share — ESPHome applies a
+float `brightness` to float channel ratios, `Adafruit_NeoPixel` an 8-bit global
+scale to 8-bit components — so a percentage means different light in the two and a
+level does not. The standalone path consumes the header directly and calls
+`strip.setBrightness(255)`, which disables Adafruit's scaling rather than maximising
+it (`b + 1` rolls a uint8_t to 0, and `show()` skips the scaling pass at 0), so the
+components are written literally.
+
+**The YAML repeats those numbers as literals instead of reading the header, and that
+is deliberate.** ESPHome accepts `!lambda` on `brightness`, on the colour channels
+and on `delay:`, but answers one on `interval:` with a flat "This option is not
+templatable!". Wiring the templatable fields through lambdas would unify the three
+values whose divergence is visible the instant anyone looks at the board, and miss
+the only one whose divergence is invisible — two devices pulsing at different
+periods look identical unless they are side by side. That inverts the argument that
+justified sharing `cc1101_config.h`, where divergence could not be seen without a
+range test. A single source of truth with one silent hole in it is the same shape as
+the inherited `gamma_correct` default: a value that looks governed and is not.
 
 The heartbeat is what makes idle distinguishable from dead, and it is gated on
 `is_ready()` so a board that sits solid red and never pulses has exactly one
@@ -354,6 +377,21 @@ Two things about it are load-bearing, not decoration:
   Assistant *and* to `esphome logs`, so the LED is the only witness. A plain
   green pulse there would be a false all-clear in the one failure mode where you
   walk over and look at the board.
+- **Gamma correction is off on both paths, and that is what makes the LED numbers
+  mean anything.** ESPHome's light component defaults to `gamma_correct: 2.8` and
+  applies brightness *linearly to the 8-bit channel* before the table lookup, so a
+  low brightness indexes entries crushed to 0 or 1. At `brightness: 15%` the
+  Wi-Fi-down pulse emitted `(1, 0, 0)` — pure red at one count out of 255, green
+  quantised away — so amber was never once on screen and the two Wi-Fi states were
+  indistinguishable on the bench. The curve exists to smooth a *dimming sweep*;
+  this LED shows three fixed colours and never sweeps, so it bought nothing and
+  cost the whole bottom of the range. `gamma_correct: 1.0` in the YAML makes a
+  brightness percentage very nearly the emitted 0-255 fraction, keeps a colour
+  ratio intact at any level, and matches `Adafruit_NeoPixel`, which applies no
+  curve at all. The percentages were then rescaled so removing the curve changed
+  no emitted level except the broken one: 50%→15% and 80%→54% are within a count
+  of what they were, while the heartbeat went from 1 to 23 — the same 23 the
+  standalone path emits from `120` through `setBrightness(50)`.
 - **The ESPHome heartbeat guards `light.turn_off` as well as the pulse start.**
   It is an async automation, so a trigger arriving mid-pulse sets the LED blue
   and an unconditional `turn_off` would then blank it for the whole ~3 s
