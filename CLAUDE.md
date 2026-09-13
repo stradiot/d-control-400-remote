@@ -238,18 +238,28 @@ Two facts about the loop seam are settled and worth not rediscovering:
 
 ## TODO
 
-### 1. Move transmission from the CPU to the RMT peripheral — code written 2026-09-12, NOT yet validated on hardware
+### 1. Move transmission from the CPU to the RMT peripheral — validated on hardware 2026-09-13
 
-Both paths build. Nothing has been on the air. Until a board has been flashed and the
-collar has beeped, treat this as untested code, not a working feature.
+Both paths flashed, the collar beeps. The standalone path gave 6/6 presses, each with
+a transmit window of 3.002 s against a predicted 3.00206 s, and a press arriving
+mid-beep was dropped without queueing or extending it — `TX done` still landed 3.002 s
+after the *start*, not after the press. The ESPHome path transmits with Wi-Fi down,
+which is also the only condition its amber heartbeat can be observed in.
 
-The first thing to check on hardware is not RF at all: a boot where the **LED still
-lights and `rmt_beep::init()` returns `ESP_OK`** proves the group clock source, the
-group prescale and the channel count all agree in practice — the whole stack of
-assumptions behind the migration, in one observation. Only then does the collar
-matter.
+The bring-up observation that carried the most was not RF: a boot where the LED lights
+and `rmt_beep::init()` returns `ESP_OK` proves the group clock source, the group
+prescale and the channel count all agree in practice. Reaching `System Ready` at all is
+that proof, since both init failures halt behind a red LED. The measured transmit
+window then confirms the achieved clock at *runtime* rather than by inference — a
+channel divider of 107 would have shown 1.5 s, a group prescale of 2 would have shown
+6 s.
 
-What remains after that is the seam measurement described in "Contiguity" above.
+What remains is the seam measurement described in "Contiguity" above. **The figures
+`printState()` prints cannot be its reference.** `frame_duration_us()` truncates to
+whole microseconds — 8502 ticks x 2.675 us is 22742.85, printed as 22742 — and
+`beep_duration_actual_us()` multiplies that already-truncated value by the frame count,
+so the error accumulates to 112 us over a 3 s beep. That is 37 ppm, larger than the
++14.38 ppm the symbol period itself carries. Divide last, or work in ticks.
 
 ### 2. Decode the protocol — done 2026-09-06
 
