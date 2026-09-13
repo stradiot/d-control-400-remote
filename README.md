@@ -43,7 +43,7 @@ Demonstration of the project triggering the collar's sound beep function.
 │   ├── led_policy.h      # Status LED palette, as levels emitted by the WS2812
 │   └── reset_reason.h    # esp_reset_reason() as a printable string
 ├── esphome/              # Home Assistant path: d-control-400.yaml + cc1101.h
-├── tools/analyze_capture.py  # IQ → envelope → run lengths → base tick → frame → encoding tests
+├── tools/analyze_capture.py  # IQ → envelope → run lengths → symbol period → frame → encoding tests
 ├── signal_captures.txt   # Decoded-frame worksheet — ENCRYPTED, not a build input
 ├── pcb/
 │   ├── gerber.zip        # Fabrication-ready Gerbers
@@ -301,10 +301,12 @@ Two properties of `SIGNAL_BEEP_TICKS` are checked at compile time, because the R
 
 ### Getting the numbers out of a capture
 
-`tools/analyze_capture.py` takes the whole pipeline — IQ file to envelope to run lengths to base tick to frame boundaries to encoding tests — and is the fastest way to a first answer. Two things are worth doing anyway:
+`tools/analyze_capture.py` takes the whole pipeline — IQ file to envelope to run lengths to symbol period to frame boundaries to encoding tests — and is the fastest way to a first answer. Given a `signal.h` it also works backwards, reading `SYMBOL_TICKS` and `RMT_RESOLUTION_HZ` to recover the timebase. Two things are worth doing anyway:
 
 * **Measure a dozen short and long pulses by hand first**, and check the script against them rather than the other way round. The script was validated against synthetic captures with known ground truth before it was ever pointed at real data, and that caught three bugs in it, any one of which would otherwise have read as a property of the signal.
 * **Capture several presses in one recording.** Cutting the result at the frame period and checking the copies are byte-identical costs nothing, needs no external ground truth, and catches errors in the crop, the sample rate, the symbol slot, the threshold and the frame boundary long before any of them are visible by eye.
+
+One verdict the script prints deserves reading carefully. If runs cap at 2× and no standard encoding fits, it reports that the frame is most likely **run-length coded** — the levels carrying no information, which rules out NRZ, Manchester, PWM and PPM together — and names a clamped capture as the alternative. Those two look identical in its tables and are separated by one hand measurement, not by argument: check the runs against the tick grid, where a healthy run-length frame sits on-grid with a tight spread and a clamped one scatters rounding errors through the frame. That distinction cost a session here. The clamping reading fitted everything on screen and was wrong — 13 presses came out 0% off-grid at σ/mean 0.6%.
 
 Two capture-side traps are worth naming, because both cost a session here:
 

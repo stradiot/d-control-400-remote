@@ -9,10 +9,15 @@ The pipeline, in order:
           ->  run-length clusters ->  base tick         ->  run lengths (ticks)
           ->  frame segmentation  ->  encoding tests    ->  signal.h snippet
 
-The single most important output is the RUN-LENGTH CLUSTER table. If it shows
-clusters at 3x and 4x the base tick, then a capture that only contains 1x and 2x
-runs was clamped by a two-bucket "short or long" classifier, and is missing
-symbols that no amount of timing calibration can recover.
+The single most important output is the RUN-LENGTH CLUSTER table. Clusters at 3x
+and 4x the base tick, in a capture that should only contain 1x and 2x runs, mean a
+two-bucket "short or long" classifier discarded symbols that no amount of timing
+calibration can recover.
+
+Runs that cap at 2x with no standard encoding fitting are NOT evidence of that. The
+likeliest reading is run-length coding, where the information is in the durations
+and the levels carry none, which rules out every standard line code in one go. Only
+a hand measurement against the tick grid separates the two.
 
 Usage:
     # From a raw rtl_sdr capture (uint8 interleaved I/Q)
@@ -156,24 +161,58 @@ def load_us(path):
     return vals
 
 
+# The ESP32-C3's RMT divides an 80 MHz APB clock by an integer, so a requested
+# RMT_RESOLUTION_HZ is realised as the nearest whole divider and the symbol period
+# follows from that rather than from the request. Matching the firmware's arithmetic
+# here keeps this script's microseconds equal to the ones actually transmitted.
+RMT_APB_HZ = 80_000_000
+
+
+def symbol_period_us(resolution_hz, symbol_ticks):
+    divider = round(RMT_APB_HZ / resolution_hz)
+    return symbol_ticks * divider / (RMT_APB_HZ / 1e6)
+
+
 def load_header(path):
     """Read SIGNAL_BEEP_TICKS (ticks) or legacy SIGNAL_BEEP (microseconds)."""
     src = open(path).read()
-    base = 1.0
-    m = re.search(r"#define\s+BASE_TICK_US\s+(\d+)", src)
-    if m:
-        base = float(m.group(1))
+
+    def macro_int(name):
+        m = re.search(r"#define\s+" + name + r"\s+(\d+)", src)
+        return int(m.group(1)) if m else None
+
+    # Current form: a symbol period in RMT channel ticks, plus the requested tick
+    # rate. Legacy form: BASE_TICK_US, whole microseconds, from the bit-banged era.
+    symbol_ticks = macro_int("SYMBOL_TICKS")
+    resolution_hz = macro_int("RMT_RESOLUTION_HZ")
+    legacy_us = macro_int("BASE_TICK_US")
+
+    base = None
+    if symbol_ticks and resolution_hz:
+        base = symbol_period_us(resolution_hz, symbol_ticks)
+    elif legacy_us:
+        base = float(legacy_us)
 
     for macro in ("SIGNAL_BEEP_TICKS", "SIGNAL_BEEP"):
         idx = src.find("#define " + macro)
         if idx == -1:
             continue
         vals = [int(x) for x in re.findall(r"-?\d+", src[idx:])]
-        scale = base if macro == "SIGNAL_BEEP_TICKS" else 1.0
         if macro == "SIGNAL_BEEP":
-            base = 1.0
-        print(f"  read {macro} from {path}  ({len(vals)} elements, base tick {base:g} us)")
-        return [v * scale for v in vals]
+            # Already absolute microseconds; no scale to find.
+            print(f"  read {macro} from {path}  ({len(vals)} elements, microseconds)")
+            return [float(v) for v in vals]
+        if base is None:
+            # Refusing here on purpose. This used to default to 1 us, which turned a
+            # 22.7 ms frame into a reported 109 us and made every number downstream
+            # wrong by the symbol period with nothing on screen to say so.
+            sys.exit(
+                f"ERROR: {path} has {macro} but no symbol period.\n"
+                "  Expected SYMBOL_TICKS + RMT_RESOLUTION_HZ (or legacy BASE_TICK_US).\n"
+                "  Without one the tick values cannot be converted to microseconds."
+            )
+        print(f"  read {macro} from {path}  ({len(vals)} elements, symbol {base:g} us)")
+        return [v * base for v in vals]
 
     sys.exit(f"ERROR: no SIGNAL_BEEP_TICKS or SIGNAL_BEEP macro in {path}")
 
@@ -474,15 +513,26 @@ def final_verdict(passed, longest):
     print("  No standard encoding matches this capture.")
     if longest <= 2:
         print()
-        print("  *** The capture is very likely CLAMPED. ***")
-        print("  Runs cap at 2x, but no encoding that caps at 2x (PWM, Manchester,")
-        print("  biphase) actually fits. The combination points at a two-bucket")
-        print("  short/long classifier having collapsed genuine 3x and 4x runs into")
-        print("  the 2x bucket - which destroys symbols that no amount of timing")
-        print("  calibration can recover.")
+        print("  Most likely RUN-LENGTH CODED, which is not a standard line code")
+        print("  and is not a fault. The levels then carry no information at all -")
+        print("  two adjacent runs at the same level would merge into one, so the")
+        print("  level sequence is fixed by the first run and everything is in the")
+        print("  durations. That is exactly why NRZ, Manchester, PWM and PPM are all")
+        print("  ruled out at once, and why runs cap at 2x.")
         print()
-        print("  Re-capture with the pulse classifier disabled, or measure the run")
-        print("  lengths directly from the envelope, and re-run this script.")
+        print("  The alternative is a CLAMPED capture: a two-bucket short/long")
+        print("  classifier collapsing genuine 3x and 4x runs into the 2x bucket,")
+        print("  destroying symbols that no timing calibration can recover.")
+        print()
+        print("  These two look identical in this table and are separated by ONE")
+        print("  measurement, not by argument. Measure the run lengths by hand off")
+        print("  the envelope and check them against the tick grid:")
+        print("    - every run on-grid, tight sigma  -> run-length coded, healthy")
+        print("    - rounding errors scattered about -> symbols really were discarded")
+        print()
+        print("  This was a live question on the capture this script was written")
+        print("  for. The clamping reading fitted everything on screen and was")
+        print("  wrong: 13 presses came out 0% off-grid at sigma/mean 0.6%.")
     else:
         print(f"  Runs reach {longest}x, so the capture is not clamped.")
         print("  This may be a non-standard or vendor-specific line code.")
@@ -493,8 +543,38 @@ def final_verdict(passed, longest):
 # ---------------------------------------------------------------------------
 
 
+def choose_rmt_timebase(base_us):
+    """Express a measured symbol period as RMT_RESOLUTION_HZ + SYMBOL_TICKS.
+
+    Two free parameters and one target, so pick the whole channel divider whose
+    nearest whole number of ticks lands closest to the measured period. Ties go to
+    the finer tick, because one SYMBOL_TICKS step is the sweep granularity the
+    firmware's 'k' command offers. The divider is 8 bits and the RMT's period field
+    is 15, which is what bounds the search.
+    """
+    best = None
+    for divider in range(1, 256):
+        tick_us = divider / (RMT_APB_HZ / 1e6)
+        ticks = round(base_us / tick_us)
+        if ticks < 1 or 2 * ticks > 32767:
+            continue
+        err = abs(ticks * tick_us - base_us)
+        if best is None or (err, -ticks) < (best[0], -best[2]):
+            best = (err, divider, ticks)
+    if best is None:
+        sys.exit(f"ERROR: cannot express a {base_us:g} us symbol on this peripheral")
+    _, divider, ticks = best
+    return round(RMT_APB_HZ / divider), ticks, divider
+
+
 def emit_header(ticks, base, per_line=24):
-    print(f"\n#define BASE_TICK_US {int(round(base))}")
+    resolution_hz, symbol_ticks, divider = choose_rmt_timebase(base)
+    realised = symbol_period_us(resolution_hz, symbol_ticks)
+    ppm = (realised - base) / base * 1e6
+    print(f"\n#define SYMBOL_TICKS      {symbol_ticks}")
+    print(f"#define RMT_RESOLUTION_HZ {resolution_hz}")
+    print(f"// symbol = {symbol_ticks} x {divider}/80 us = {realised:.4f} us "
+          f"({ppm:+.1f} ppm vs the measured {base:.4f} us)")
     print("\n// clang-format off")
     print("#define SIGNAL_BEEP_TICKS { \\")
     ints = [int(round(t)) for t in ticks]
