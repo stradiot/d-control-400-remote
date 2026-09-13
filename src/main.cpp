@@ -52,6 +52,48 @@ bool heartbeatLit = false;
 char cmdBuf[32];
 uint8_t cmdLen = 0;
 
+// --- Loop-seam sweep ---
+// Instrumentation for what the RMT's loop wrap costs. Answered 2026-09-13 -- nothing,
+// to within +/-2 ns per frame, where one APB clock would be 12.5 ns -- and kept for
+// the same reason the k sweep is kept: it is how the achieved channel clock gets
+// checked at runtime instead of inferred. See the header comment on
+// rmt_beep::tx_start_us for why this must be read as a slope.
+//
+// Both timestamps sit a fixed, unknown number of cycles away from the first and last
+// edges, and a fixed offset added to one elapsed time is indistinguishable from a
+// fixed per-seam cost summed over that beep -- same sign, same magnitude, same on
+// every press. The frame count is the lever that separates them: the offsets do not
+// scale with it and the seam does. Fit elapsed time against frames; the intercept absorbs
+// every fixed cost and the slope is the per-frame period the hardware actually
+// realises, wrap included.
+//
+// Durations, not frame counts, because set_duration_ms() is the existing knob;
+// frame_count() rounds each to whole frames and last_frame_count() reports what it
+// landed on. The points do not need to be round numbers, only known ones. The span
+// runs from ~22 frames to just under the 1023-frame batch ceiling, which is the
+// widest lever arm available without chaining a second batch.
+constexpr uint32_t SWEEP_MS[] = {500, 1000, 2000, 4000, 8000, 12000, 16000, 20000, 23000};
+constexpr size_t SWEEP_STEPS = sizeof(SWEEP_MS) / sizeof(SWEEP_MS[0]);
+constexpr unsigned long SWEEP_GAP_MS = 2000;
+
+bool sweepActive = false;
+bool sweepPending = false;  // a beep is in flight and not yet harvested
+size_t sweepStep = 0;
+unsigned long sweepNextMs = 0;
+uint32_t sweepSavedMs = 0;
+uint32_t sweepFrames[SWEEP_STEPS];
+int64_t sweepUs[SWEEP_STEPS];
+uint32_t sweepCycles[SWEEP_STEPS];
+
+// Serial.print() has no 64-bit overload, and casting to int32_t silently wrapped the
+// first sweep's 3.59e9-cycle span to a negative number. Everything wide goes through
+// here instead.
+void printI64(int64_t v) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    Serial.print(buf);
+}
+
 //
 // --- LED Feedback ---
 void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -163,6 +205,100 @@ void pollTransmit() {
     lastHeartbeatMs = millis();
 
     Serial.println(F("TX done"));
+
+    // One measurement point per beep, whether it came from the sweep, a button or a
+    // 't'. Raw cycles and the frame count the loop counter was actually given --
+    // deliberately not a derived period, because a single point cannot give one.
+    Serial.print(F("MEAS frames=")); Serial.print(rmt_beep::last_frame_count());
+    Serial.print(F(" us=")); printI64(rmt_beep::last_tx_us());
+    Serial.print(F(" cycles=")); Serial.println(rmt_beep::last_tx_cycles());
+}
+
+// The frame period the hardware is predicted to realise, in NANOSECONDS, derived at
+// runtime rather than hardcoded so a wrong clock shows up as a wrong prediction
+// instead of a silent assumption. The divider is what the driver picked for the
+// requested resolution (214 off an 80 MHz APB). Nanoseconds because the exact value
+// is 22742.85 us -- an integer number of nanoseconds, and not an integer number of
+// microseconds, so this is the coarsest unit that stays exact: 8502 x 214 x 12.5.
+uint64_t predictedNsPerFrame() {
+    const uint32_t apbHz = getApbFrequency();
+    const uint32_t divider = (apbHz + RMT_RESOLUTION_HZ / 2) / RMT_RESOLUTION_HZ;
+    return (uint64_t)rmt_beep::frame_channel_ticks() * divider * 1000000000ULL / apbHz;
+}
+
+// Prints the sweep as raw triples, for fitting off-device. The endpoint slope below
+// is a sanity check and NOT the result: two points cannot show whether the relation
+// is linear, and non-linearity would mean one of the "fixed" offsets is not fixed.
+void printSweepResult() {
+    const uint64_t predictedNs = predictedNsPerFrame();
+
+    Serial.println(F("--- loop-seam sweep ---"));
+    Serial.print(F("  apb Hz            : ")); Serial.println(getApbFrequency());
+    Serial.print(F("  channel ticks/frm : ")); Serial.println(rmt_beep::frame_channel_ticks());
+    Serial.print(F("  predicted ns/frm  : ")); printI64((int64_t)predictedNs); Serial.println();
+    Serial.println(F("  frames,us,cycles"));
+
+    for (size_t i = 0; i < SWEEP_STEPS; ++i) {
+        Serial.print(F("  ")); Serial.print(sweepFrames[i]);
+        Serial.print(F(",")); printI64(sweepUs[i]);
+        Serial.print(F(",")); Serial.println(sweepCycles[i]);
+    }
+
+    const int64_t df = (int64_t)sweepFrames[SWEEP_STEPS - 1] - (int64_t)sweepFrames[0];
+    const int64_t dus = sweepUs[SWEEP_STEPS - 1] - sweepUs[0];
+    const int64_t dcyc = (int64_t)sweepCycles[SWEEP_STEPS - 1] - (int64_t)sweepCycles[0];
+    if (df > 0 && dus > 0) {
+        // Excess per frame in nanoseconds. One channel tick is 2675 ns, so whole-tick
+        // and even sub-tick wrap costs are both readable here without floating point.
+        const int64_t excessNs = (dus * 1000 - (int64_t)predictedNs * df) / df;
+        Serial.print(F("  endpoint dframes  : ")); printI64(df); Serial.println();
+        Serial.print(F("  endpoint dus      : ")); printI64(dus); Serial.println();
+        Serial.print(F("  excess ns/frm     : ")); printI64(excessNs); Serial.println();
+        // The diagnostic: what the CPU performance counter's rate actually is over the
+        // same span. It is not 160 MHz, and this line is the evidence rather than an
+        // assumption -- see the note in rmt_beep.h.
+        Serial.print(F("  cpu counter Hz    : "));
+        printI64(dcyc * 1000000LL / dus); Serial.println();
+    }
+}
+
+// Non-blocking sweep driver, stepped from loop(). One beep per point, harvested
+// after the ISR has cleared busy and the radio is back in standby, then a gap before
+// the next -- the gap is not a settling requirement, it just keeps a 23 s burst from
+// running straight into the next one.
+void pollSweep() {
+    if (!sweepActive || txActive || rmt_beep::is_busy()) {
+        return;
+    }
+
+    if (sweepPending) {
+        sweepFrames[sweepStep] = rmt_beep::last_frame_count();
+        sweepUs[sweepStep] = rmt_beep::last_tx_us();
+        sweepCycles[sweepStep] = rmt_beep::last_tx_cycles();
+        sweepPending = false;
+        sweepStep++;
+        sweepNextMs = millis() + SWEEP_GAP_MS;
+        return;
+    }
+
+    if ((long)(millis() - sweepNextMs) < 0) {
+        return;
+    }
+
+    if (sweepStep == SWEEP_STEPS) {
+        sweepActive = false;
+        rmt_beep::set_duration_ms(sweepSavedMs);
+        printSweepResult();
+        return;
+    }
+
+    if (!rmt_beep::set_duration_ms(SWEEP_MS[sweepStep]) || !startTransmit()) {
+        Serial.println(F("ERR sweep aborted"));
+        sweepActive = false;
+        rmt_beep::set_duration_ms(sweepSavedMs);
+        return;
+    }
+    sweepPending = true;
 }
 
 // --- Serial calibration interface ---
@@ -179,6 +315,7 @@ void printState() {
     Serial.print(F("     frames         : ")); Serial.println(rmt_beep::frame_count());
     Serial.print(F("     actual beep us : ")); Serial.println(rmt_beep::beep_duration_actual_us());
     Serial.println(F("  t  transmit once     ?  this help"));
+    Serial.println(F("  m  loop-seam sweep (~90 s of airtime -- silence the collar)"));
 }
 
 void executeCommand(const char *cmd) {
@@ -237,6 +374,23 @@ void executeCommand(const char *cmd) {
             if (startTransmit()) {
                 Serial.println(F("TX ..."));
             }
+            break;
+        case 'm':
+            // Loop-seam sweep. Long and loud: roughly 87 s of airtime plus gaps, and
+            // the collar beeps for every second of it. Power the collar down or take
+            // it out of range first, and mind the duty cycle in the 869.4-869.65 MHz
+            // sub-band.
+            if (sweepActive || txActive || rmt_beep::is_busy()) {
+                Serial.println(F("ERR m rejected (busy)"));
+                break;
+            }
+            sweepSavedMs = rmt_beep::beep_duration_ms;
+            sweepStep = 0;
+            sweepPending = false;
+            sweepNextMs = millis();
+            sweepActive = true;
+            Serial.print(F("sweep started, ")); Serial.print(SWEEP_STEPS);
+            Serial.println(F(" points"));
             break;
         case '?':
             printState();
@@ -349,5 +503,6 @@ void loop() {
     }
 
     pollTransmit();
+    pollSweep();  // after pollTransmit: it harvests the point txActive has just freed
     pollHeartbeat();
 }

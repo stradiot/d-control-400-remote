@@ -19,6 +19,8 @@
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
 #include "esp_attr.h"
+#include "esp_cpu.h"
+#include "esp_timer.h"
 #include "soc/soc_caps.h"
 
 #include "pinout.h"
@@ -45,7 +47,9 @@ static_assert(kWordCount + 1 <= SOC_RMT_MEM_WORDS_PER_CHANNEL,
 
 // RMT_TX_LOOP_NUM_CHn is bits 18:9 of RMT_CHnCONF1_REG -- ten bits, and a count
 // rather than an index. Past this the driver chains a second batch by stopping and
-// restarting the channel, and the seam that introduces has never been measured.
+// restarting the channel. That is a different seam from the loop wrap below -- the CPU
+// re-arming the channel rather than the peripheral reloading its read pointer -- and
+// unlike the wrap it has never been measured.
 inline constexpr uint32_t kMaxFramesPerBatch = 1023;
 
 constexpr uint32_t abs_ticks(int32_t v) { return (uint32_t)(v < 0 ? -v : v); }
@@ -94,6 +98,46 @@ inline rmt_encoder_handle_t encoder = nullptr;
 inline rmt_symbol_word_t frame[kWordCount];
 inline volatile bool busy = false;
 
+// --- Loop-seam instrumentation ---
+// Timestamps bracketing the last transmission, for measuring what the RMT's loop
+// wrap actually costs.
+//
+// The REFERENCE is esp_timer_get_time(), not the CPU cycle counter. On the C3 the
+// systimer behind esp_timer is clocked from XTAL and only XTAL (SYSTIMER_CLK_SRC_XTAL
+// is the sole enumerator in clk_tree_defs.h), which is the same 40 MHz crystal the
+// PLL feeding the RMT's 80 MHz APB clock is locked to -- so crystal error and drift
+// stay common-mode and cancel -- and it is a free-running peripheral counter, so
+// unlike a CPU counter it is indifferent to stalls, clock gating and CPU power state.
+// 1 us granularity is 0.04 ppm over a 23 s batch against a 118 ppm effect.
+//
+// The answer, 2026-09-13: the wrap is free. Nine beeps from 22 to 1011 frames put the
+// per-frame period at the predicted 22742.85 us with a residual slope of -0.66 ns per
+// frame against a +/-2 ns bound, where one APB clock would be 12.5 ns. The +5 us common
+// to every point is the fixed cost of the two endpoints below, which is exactly where
+// the design intended it to land.
+//
+// The CPU cycle count is kept only as a DIAGNOSTIC, and reported next to the
+// microseconds so the instrument states its own ruler's error instead of assuming it.
+// It is not a cycle counter in the architectural sense: SOC_CPU_HAS_CSR_PC is 1 on
+// this part, so rv_utils_get_cycle_count() reads Espressif's performance-counter CSR
+// PCCR (0x7e2) under PCER/PCMR rather than the standard RISC-V mcycle. Measured
+// against the systimer it runs about 2370 ppm slow, which is why it cannot be the
+// reference: that is twenty times the effect being looked for.
+//
+// NEITHER endpoint is an edge. The start lands after rmt_transmit() has enabled the
+// channel but before the first edge reaches the pin; the end lands after the
+// peripheral raised its interrupt, the CPU took the vector and the driver ran its
+// own prologue -- and, because the C3 cannot auto-stop a loop, after the channel has
+// emitted a little past the target. Every one of those is a FIXED offset, which is
+// why the per-frame period must be read as the SLOPE of cycles against frame count
+// and never as a single elapsed time divided by frames. Vary the frame count; the
+// offsets do not care about it and the seam does.
+inline volatile int64_t tx_start_us = 0;
+inline volatile int64_t tx_end_us = 0;
+inline volatile uint32_t tx_start_cycles = 0;
+inline volatile uint32_t tx_end_cycles = 0;
+inline volatile uint32_t tx_frames = 0;
+
 // Runs on the loop-end interrupt. The C3 has no loop auto-stop -- SOC_RMT_SUPPORT_
 // TX_LOOP_COUNT is set but SOC_RMT_SUPPORT_TX_LOOP_AUTO_STOP is not -- so the driver
 // issues rmt_ll_tx_stop() from its own ISR before calling this, which means a few
@@ -101,6 +145,9 @@ inline volatile bool busy = false;
 // frame is truncated rather than absent, exactly as the real remote's is when the
 // button is released.
 inline bool IRAM_ATTR on_done(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *) {
+    // Reference first, diagnostic second; both before anything else in the ISR varies.
+    tx_end_us = esp_timer_get_time();
+    tx_end_cycles = esp_cpu_get_cycle_count();
     busy = false;
     return false;  // no higher-priority task woken
 }
@@ -213,8 +260,10 @@ inline bool start() {
         return false;
     }
 
+    const uint32_t frames = frame_count();
+
     rmt_transmit_config_t transmit_config = {};
-    transmit_config.loop_count = (int)frame_count();
+    transmit_config.loop_count = (int)frames;
     // Sets both the appended end marker's level bits and RMT_IDLE_OUT_LV, which is
     // what the pin falls back to when the driver aborts the loop mid-frame.
     transmit_config.flags.eot_level = 0;
@@ -226,8 +275,31 @@ inline bool start() {
         busy = false;
         return false;
     }
+    // Taken here rather than before the call so the driver's dispatch work sits
+    // outside the window. Placement only has to be CONSISTENT -- it shifts the fixed
+    // offset, which the slope discards -- but closer to the first edge is tidier.
+    tx_start_us = esp_timer_get_time();
+    tx_start_cycles = esp_cpu_get_cycle_count();
+    tx_frames = frames;
     return true;
 }
+
+// Elapsed microseconds across the last transmission -- the measurement. esp_timer's
+// counter is 64-bit and does not wrap in any life this device will have. Meaningless
+// while is_busy(); the 64-bit reads are not atomic on a 32-bit core, so only read
+// these once the busy flag has cleared.
+inline int64_t last_tx_us() { return tx_end_us - tx_start_us; }
+
+// Elapsed CPU performance-counter ticks, for reporting alongside the microseconds so
+// the counter's rate can be read back rather than assumed. Unsigned on purpose: the
+// counter is 32 bits and a full 1023-frame batch is about 3.7e9 ticks, under 2^32,
+// so at most one wrap can fall inside a measurement and unsigned subtraction is exact
+// across one. Not a time reference -- see the note above.
+inline uint32_t last_tx_cycles() { return tx_end_cycles - tx_start_cycles; }
+
+// Frames actually requested of the loop counter, which is what frame_count() rounded
+// to -- not what was asked for in milliseconds. This is the x in the slope fit.
+inline uint32_t last_frame_count() { return tx_frames; }
 
 // Symbol-period sweep. Rescales every run at once, which is the whole point of
 // storing the payload as run lengths rather than absolute durations.
