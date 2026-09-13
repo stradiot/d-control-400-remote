@@ -1,3 +1,5 @@
+#pragma once
+
 // --- Pin Definitions ---
 #define CC1101_MISO 0
 #define CC1101_MOSI 3

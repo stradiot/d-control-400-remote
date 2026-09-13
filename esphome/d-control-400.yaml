@@ -12,7 +12,12 @@ esphome:
     - ../include/rmt_beep.h
   libraries:
     - SPI
-    - jgromes/RadioLib@^6.0.0
+    # Pinned exactly rather than with a caret, for the same reason platformio.ini
+    # pins it: RadioLib sits directly in the transmit path (transmitDirect, standby,
+    # the CC1101 register writes), so a silent minor bump is a silent change to RF
+    # behaviour -- and the two firmware paths are only comparable if they build
+    # against the same one.
+    - jgromes/RadioLib@6.6.0
   on_boot:
     # Priority 600 runs early in the boot sequence, before Wi-Fi connects
     priority: 600
