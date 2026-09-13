@@ -230,11 +230,11 @@ A build that sent **one** frame followed by a 5 ms gap produced **zero** beeps, 
 
 Under RMT this stops being a knob at all. The frame sits in the channel's own memory and the hardware loops it, so a beep is one contiguous run of frames by construction. The three layered constants the bit-banged firmware needed (`FRAMES_PER_BURST`, `TRANSMIT_GAP_US`, `TRANSMIT_REPEAT`) collapse into `BEEP_DURATION_MS`, which the firmware rounds to a whole number of frames — 132 frames of 22.743 ms at 3000 ms — and loads into the RMT loop counter. All three existed only because the CPU cannot hold `vTaskSuspendAll()` indefinitely; `TRANSMIT_GAP_US` in particular was a ceiling on damage, not a value with a right answer.
 
-`RMT_TX_LOOP_NUM_CHn` is ten bits, so one batch covers up to 1023 frames (~23 s). Past that the driver chains a second batch by stopping and restarting the channel, and that seam has never been measured — `rmt_beep::set_duration_ms()` refuses a duration that would need one.
+`RMT_TX_LOOP_NUM_CHn` is ten bits, so one batch covers up to 1023 frames (~23 s). Past that the driver chains a second batch by stopping and restarting the channel. That is a *different* seam from the loop wrap measured below — it involves the CPU stopping and re-arming the channel rather than the peripheral reloading its own read pointer — and it has never been measured. `rmt_beep::set_duration_ms()` refuses a duration that would need one.
 
 Two facts about the loop seam are settled and worth not rediscovering:
 - **The frame survives looping because its run count is even.** 88 runs means it starts ON and ends OFF, so each repeat begins with a real OFF→ON edge, and that edge is what gives the last run its duration. On the final frame that run is lost to silence — a transmission ending on a LOW run always loses it, since silence never supplies the closing rising edge — which costs nothing here and is exactly what the real remote does on button release.
-- **What the peripheral itself does at the seam is unmeasured.** The TRM says only that the transmitter "starts transmitting the first data again". A decode cannot detect it (the decoder rounds anything under half a symbol away); a frame-start-to-frame-start period comparison across a seam-free span versus a seam-crossing one can.
+- **The wrap itself is free — measured 2026-09-13.** The TRM says only that the transmitter "starts transmitting the first data again", and it turns out to mean that literally: the peripheral reloads its read pointer with no bubble. Nine beeps from 22 to 1011 frames, timed with `esp_timer_get_time()`, put the per-frame period at the predicted 22742.85 µs with a residual slope of **−0.66 ns/frame against a ±2 ns bound** — six times smaller than the 12.5 ns a single APB clock would cost. The +5 µs offset common to all nine points is the fixed software cost at the two ends, and it does not grow with frame count, which is the whole reason the measurement was built as a slope. Waveform shape at the seam needs no separate check: 88 runs starting ON and ending OFF puts an OFF run against an ON run there, so the one shape failure that could hide inside an unchanged duration — two same-level runs merging — cannot occur.
 
 ## TODO
 
@@ -254,12 +254,41 @@ window then confirms the achieved clock at *runtime* rather than by inference �
 channel divider of 107 would have shown 1.5 s, a group prescale of 2 would have shown
 6 s.
 
-What remains is the seam measurement described in "Contiguity" above. **The figures
-`printState()` prints cannot be its reference.** `frame_duration_us()` truncates to
-whole microseconds — 8502 ticks x 2.675 us is 22742.85, printed as 22742 — and
-`beep_duration_actual_us()` multiplies that already-truncated value by the frame count,
-so the error accumulates to 112 us over a 3 s beep. That is 37 ppm, larger than the
-+14.38 ppm the symbol period itself carries. Divide last, or work in ticks.
+The seam measurement that remained is **done, same day**, and its result is in
+"Contiguity" above: the loop wrap costs nothing. It also confirmed the realised channel
+rate at runtime to better than 0.1 ppm — the measured per-frame period matched the
+predicted 22742.85 µs to −0.66 ns — which is a far sharper check on the divider than
+the 3.002 s transmit window could give, and it settles that the +14.38 ppm claimed for
+`SYMBOL_TICKS` is the real figure rather than an arithmetic one.
+
+The instrument is the `m` command in `src/main.cpp`: nine beeps of increasing frame
+count, each bracketed by timestamps, reported as raw `frames,us,cycles` triples for
+fitting off-device. It stays in the firmware for the same reason the `k` sweep does —
+it is how the achieved clock gets checked without inferring it — and it carries its own
+calibration line, which is the part worth copying.
+
+**Two traps, both about trusting a number that looks authoritative:**
+
+- **`printState()`'s figures cannot be a timing reference.** `frame_duration_us()`
+  truncates to whole microseconds — 8502 ticks x 2.675 us is 22742.85, printed as
+  22742 — and `beep_duration_actual_us()` multiplies that already-truncated value by
+  the frame count, so the error accumulates to 112 us over a 3 s beep. That is 37 ppm,
+  larger than the +14.38 ppm the symbol period itself carries. Divide last, or work in
+  ticks. This is why `predictedNsPerFrame()` works in nanoseconds: 22742.85 µs is an
+  exact whole number of nanoseconds and is not one of microseconds.
+- **`esp_cpu_get_cycle_count()` is not a clock on this part**, and the first version of
+  the instrument was defeated by assuming it was. `SOC_CPU_HAS_CSR_PC` is 1 on the C3,
+  so `rv_utils_get_cycle_count()` compiles to a read of Espressif's performance-counter
+  CSR `PCCR` (0x7e2) under `PCER`/`PCMR`, not the architectural RISC-V `mcycle`. It
+  counts a selected event under configurable conditions, and measured against the
+  systimer it runs **2370 ppm slow** — reproducibly, 159.62 MHz against a nominal 160 —
+  which is twenty times the effect it was being used to look for. `getCpuFrequencyMhz()`
+  reports the *configured* frequency and is no evidence about the counter. Use
+  `esp_timer_get_time()`: the C3's systimer has exactly one clock source
+  (`SYSTIMER_CLK_SRC_XTAL`, the sole enumerator in `clk_tree_defs.h`), which is the same
+  crystal the PLL behind the RMT's APB clock is locked to, so the common-mode
+  cancellation still holds — and it is a free-running peripheral counter, indifferent to
+  the CPU state that broke the other one.
 
 ### 2. Decode the protocol — done 2026-09-06
 
@@ -274,7 +303,7 @@ during any of it, and beep-only remains the scope of the shipped firmware.
 
 ## RF constraints that look wrong but aren't
 
-- **Bit rate 100 kbps for a ~5 kBaud signal.** Deliberate 20x oversampling. In async mode the CC1101 samples GDO0 on its internal clock; at 5 kbps the PA gating jitters badly. Do not "fix" this to match the actual baud.
+- **Bit rate 100 kbps for a ~4.8 kBaud signal.** Deliberate 20x oversampling. In async mode the CC1101 samples GDO0 on its internal clock; at 5 kbps the PA gating jitters badly. Do not "fix" this to match the actual baud.
 - **`RX_BANDWIDTH` set on a TX-only device.** Selects a stable hardware filter tap off the 26 MHz crystal; keeps the RF bursts clean. Not dead config.
 - **Frequency is 869.525 MHz**, not 433 MHz. The CC1101 module must be the 868 MHz / 26 MHz-crystal variant.
 - **The symbol period is 208.647 µs, realised as 78 channel ticks of 2.675 µs** — not 200, and no longer the rounded 209 the bit-banged engine was stuck with. Measured frame-start to frame-start: 272910 samples across exactly 654 ticks (417.294 samples/tick), with the six intermediate estimates agreeing to within 0.02%. Measure it this way rather than across the preamble or across the whole message — both endpoints are then rising edges at the same structural position, so rise-time bias cancels, and there is no ambiguity about whether the truncated final tick counts. Do not trust URH's *Autodetect parameters* here — it reports 400 samples/symbol, wrong by 9%, because it fits a symbol length rather than measuring one.
@@ -346,7 +375,14 @@ and already at 214, so it can only lengthen the period by ~19.6% before saturati
 
 ## Safety gate
 
-`cc1101_ctrl::is_ready()` (ESPHome) / the init check in `setup()` (standalone) guards every transmission path. If the CC1101 doesn't answer on SPI at boot, transmission is a no-op — this prevents SPI crashes on absent hardware. Keep new trigger paths behind that flag.
+The two paths reach the same guarantee by opposite means, and only one of them has a
+flag. **ESPHome** keeps running: `cc1101_ctrl::is_ready()` stays false, the switch and
+every other trigger silently no-op, and new trigger paths must be put behind that flag
+explicitly. **Standalone** never gets the chance: each of the three failures in
+`setup()` — `radio.begin()`, `cc1101_config::apply()`, `rmt_beep::init()` — lights the
+LED red and halts in `while (true)`, so `loop()` is never reached and no trigger path
+exists to guard. Either way the CC1101 is never driven when it did not answer on SPI at
+boot, which is what prevents the crash on absent hardware.
 
 Wi-Fi `output_power: 8.5dBm` in the YAML is a hardware fix for LDO brownout on the C3 Mini regulator. Do not raise it.
 
@@ -376,9 +412,12 @@ justified sharing `cc1101_config.h`, where divergence could not be seen without 
 range test. A single source of truth with one silent hole in it is the same shape as
 the inherited `gamma_correct` default: a value that looks governed and is not.
 
-The heartbeat is what makes idle distinguishable from dead, and it is gated on
-`is_ready()` so a board that sits solid red and never pulses has exactly one
-problem (radio init) rather than two.
+The heartbeat is what makes idle distinguishable from dead, and on both paths a board
+that sits solid red and never pulses has exactly one problem (radio init) rather than
+two — but the mechanism differs, per "Safety gate" above. The ESPHome interval carries
+an `is_ready()` condition, because that path survives a failed init and would otherwise
+pulse green over a dead radio. The standalone path needs no such condition: a failed
+init halts in `setup()`, so `pollHeartbeat()` is never called at all.
 
 Two things about it are load-bearing, not decoration:
 
@@ -399,17 +438,23 @@ Two things about it are load-bearing, not decoration:
   brightness percentage very nearly the emitted 0-255 fraction, keeps a colour
   ratio intact at any level, and matches `Adafruit_NeoPixel`, which applies no
   curve at all. The percentages were then rescaled so removing the curve changed
-  no emitted level except the broken one: 50%→15% and 80%→54% are within a count
-  of what they were, while the heartbeat went from 1 to 23 — the same 23 the
-  standalone path emits from `120` through `setBrightness(50)`.
+  every ESPHome brightness onto a level from `led_policy.h`: 20% emits 51, which is
+  `LED_LEVEL_SOLID` 50 to within a count, and 9% emits 23, which is `LED_LEVEL_PULSE`
+  exactly — the same 23 the standalone path writes literally. That deliberately
+  changed two levels rather than preserving them. Under the curve the solid states
+  ran at 50% and 80% and emitted 37 and 135; both are now 51, so the transmitting
+  blue is dimmer than it was and the boot states slightly brighter. Preserving the
+  old appearance would have meant 15% and 54% and two solid states that differ from
+  each other and from the header, which is the divergence the shared palette exists
+  to remove.
 - **The ESPHome heartbeat guards `light.turn_off` as well as the pulse start.**
   It is an async automation, so a trigger arriving mid-pulse sets the LED blue
   and an unconditional `turn_off` would then blank it for the whole ~3 s
   transmission. Both ends need the `script.is_running: transmit_beep` check.
   `src/main.cpp` now needs the same guard, and that is a change the RMT migration
-  forced. The old `triggerTransmit()` blocked `loop()`, so the heartbeat and the
-  transmission were mutually exclusive by construction. The beep now runs in
-  hardware while `loop()` keeps turning, so `pollHeartbeat()` returns early while
+  forced. The pre-RMT transmit call blocked `loop()` for the whole burst, so the
+  heartbeat and the transmission were mutually exclusive by construction. The beep
+  now runs in hardware while `loop()` keeps turning, so `pollHeartbeat()` returns early while
   `txActive` — guarding the start of a pulse alone would still let a pulse that
   began just before the trigger blank the LED for the whole beep.
 

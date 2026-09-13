@@ -60,7 +60,6 @@ namespace cc1101_ctrl {
 
         if (state == RADIOLIB_ERR_NONE) {
             ESP_LOGI("CC1101", "Radio initialized successfully!");
-            // Use && to short-circuit if any of these fail
 
             // Shared with the standalone path -- see include/cc1101_config.h.
             // Carrier and power default to the captured values; only the standalone
@@ -82,7 +81,7 @@ namespace cc1101_ctrl {
 
         // Claim GDO0 for the RMT. The status LED (esp32_rmt_led_strip) is the other
         // RMT client on this board and the group clock source is shared, so this can
-        // only succeed if both ask for APB -- see the note in signal.h. It runs after
+        // only succeed if both ask for APB -- see rmt_beep::init(). It runs after
         // the LED component's own setup because on_boot priority 600 does.
         esp_err_t err = rmt_beep::init();
         if (err != ESP_OK) {

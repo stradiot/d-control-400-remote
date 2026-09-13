@@ -158,7 +158,7 @@ Only the carrier frequency comes from a datasheet. The rest were derived from SD
 | Sync word | Disabled | Raw pulses; the packet engine is bypassed entirely. |
 | Preamble / CRC | Disabled | Same reason — asynchronous direct mode. |
 | Transmission mode | Asynchronous direct | GDO0's logic level maps straight to the PA. HIGH = RF on, LOW = RF off. |
-| Symbol period | 208.647 µs (stored as `209`) | Measured, not rounded. Every run is one or two of these. See [Measuring the symbol period](#measuring-the-symbol-period). |
+| Symbol period | 208.647 µs | Measured, not estimated. Stored as 78 RMT channel ticks of 2.675 µs = 208.65 µs, +14 ppm. Every run is one or two of these. See [Measuring the symbol period](#measuring-the-symbol-period). |
 
 ---
 
@@ -208,6 +208,10 @@ Under RMT contiguity is free rather than bought, so the three layered knobs the 
 The other two are gone because nothing in the protocol ever wanted them. Both existed only because the CPU cannot hold `vTaskSuspendAll()` indefinitely, so a long transmission had to be chopped into pieces with scheduler windows between them; the gap in particular was a ceiling on damage (5 ms inaudible, 30 ms audibly chopping) rather than a value with a right answer. The evidence that the receiver never needed them was already in hand before the migration: with the gap set to zero at runtime on the standalone path, 126 frames ran back-to-back over 2.87 s — the shape of a real button hold — and decoded 6/6.
 
 That the payload's run count is **even** is what makes the hardware loop legal, and it is a property of the frame rather than a convenience. Each RMT word holds two entries, so 88 runs is exactly 44 words with no half-filled tail; and because the frame starts ON and ends OFF, each repeat begins with a real OFF→ON edge instead of two same-level runs merging at the seam. The peripheral replays each entry's stored level bit verbatim and never enforces alternation, so an odd-length frame could not be looped out of a single block at all.
+
+The wrap back to the first entry is **free**, which is worth knowing for anything else that loops RMT output. The reference manual says only that the transmitter "starts transmitting the first data again" and does not say whether the jump costs any output time; measured here, it costs none. Nine beeps from 22 to 1011 frames, each bracketed by `esp_timer_get_time()`, give a per-frame period matching the predicted 22,742.85 µs with a residual slope of −0.66 ns per frame against a ±2 ns bound — six times smaller than the 12.5 ns a single APB clock would add. A fixed +5 µs appears in every measurement and does not grow with frame count, which is what identifies it as software overhead at the two ends rather than anything the peripheral does.
+
+The measurement is a **slope**, not an elapsed time, and that is the part worth copying. Neither timestamp is an edge: the first lands after the channel is enabled but before the first edge reaches the pin, the second after the interrupt, the vector and the driver's prologue. Those offsets are unknown but fixed, and a fixed offset added to one duration is indistinguishable from a fixed per-seam cost summed over that beep. Varying the frame count separates them — the offsets do not scale with it and a per-seam cost does — so the intercept absorbs the software and the slope is the hardware.
 
 
 ---
@@ -376,7 +380,7 @@ The onboard RGB LED reports the device state:
 * 🔵 **Solid blue:** transmitting. The heartbeat is suppressed for the duration.
 * ⚫ **Off:** no power, or the firmware has crashed.
 
-The heartbeat exists so that idle is distinguishable from dead. On the ESPHome path its colour encodes the Wi-Fi state because nothing else can: a device with a dropped link is alive and transmits fine but is invisible to Home Assistant *and* to `esphome logs`, so the LED is the only witness — a plain green pulse there would be a false all-clear in exactly the failure mode where you walk over and look at the board. And because the heartbeat is gated on the radio being ready, a board sitting solid red and never pulsing has exactly one problem rather than two.
+The heartbeat exists so that idle is distinguishable from dead. On the ESPHome path its colour encodes the Wi-Fi state because nothing else can: a device with a dropped link is alive and transmits fine but is invisible to Home Assistant *and* to `esphome logs`, so the LED is the only witness — a plain green pulse there would be a false all-clear in exactly the failure mode where you walk over and look at the board. And a board sitting solid red and never pulsing has exactly one problem rather than two — by different means on each path. The ESPHome heartbeat carries an explicit radio-ready condition, because that path survives a failed init and would otherwise pulse green over a dead radio; the standalone path needs no condition, because a failed init halts in `setup()` and the heartbeat is never reached.
 
 ---
 
@@ -399,6 +403,7 @@ The standalone firmware exposes its RF parameters over the serial monitor (11520
 | `p <dBm>` | Output power |
 | `f <MHz>` | Carrier frequency |
 | `t` | Transmit one beep |
+| `m` | Loop-seam sweep — nine beeps of increasing length, reported as `frames,us,cycles` for fitting |
 | `?` | Print current state and the computed frame duration, frame count and beep length |
 
 It exists so that a new capture can be brought in without a reflash between trials, which is the situation these parameters are actually uncertain in. The values committed here are already settled, so nothing needs sweeping on a working build.
@@ -406,6 +411,26 @@ It exists so that a new capture can be brought in without a reflash between tria
 When bringing up your own signal, the useful diagnostic is that the two common faults look different: a wrong symbol period produces *intermittent* triggering, a wrong frame structure produces *none at all*. If the collar never responds, check the payload and the run count before touching the timebase — no amount of sweeping will find that fault.
 
 `k` and `d` are refused while a beep is in flight, and either is refused if the result would not fit the hardware: a symbol period whose long run overflows the RMT's 15-bit duration field, or a beep longer than one 1023-frame batch.
+
+`m` is the instrument the loop-seam figure above came from, and it is about 90 seconds of continuous transmission — the collar beeps for all of it, so power it down or take it out of range first, and mind the duty cycle limit in the 869.4–869.65 MHz sub-band. It also prints a `cpu counter Hz` line, which is not decoration: it reports what the CPU's cycle counter is actually doing over the same span, so the measurement states its own reference rather than assuming it. On this part that number comes out near 159.6 MHz rather than the nominal 160, for the reason in the next section.
+
+### A trap: `esp_cpu_get_cycle_count()` is not a clock on the C3
+
+The first version of the seam instrument used the CPU cycle counter as its reference and produced a confident, reproducible, wrong answer — a per-frame period 2370 ppm *below* prediction, which is impossible, since a loop wrap can only add time.
+
+The counter is the problem. `soc_caps.h` defines `SOC_CPU_HAS_CSR_PC` as 1 for this part, and `rv_utils_get_cycle_count()` branches on it:
+
+```c
+#if !SOC_CPU_HAS_CSR_PC
+    return RV_READ_CSR(cycle);          /* the architectural counter */
+#else
+    return RV_READ_CSR(CSR_PCCR_MACHINE);   /* CSR 0x7e2 — a performance counter */
+#endif
+```
+
+So what comes back is Espressif's performance counter, governed by `PCER` (which event) and `PCMR` (under what conditions) — an event counter, not a guaranteed tick of the CPU clock. Measured against the systimer it runs about **2370 ppm slow**, reproducibly, at roughly 159.62 MHz against a nominal 160. `getCpuFrequencyMhz()` will cheerfully report 160; it reports the *configured* frequency and says nothing about the counter.
+
+Use `esp_timer_get_time()` for anything timing-critical. On the C3 its systimer has exactly one clock source — `clk_tree_defs.h` declares `SYSTIMER_CLK_SRC_XTAL` and nothing else — which is the same crystal the PLL behind the RMT's 80 MHz APB clock is locked to, so crystal error and drift cancel between the measurement and the thing being measured. It is also a free-running peripheral counter, so unlike a CPU counter it is indifferent to stalls, clock gating and CPU power state. At 1 µs granularity it resolves 0.04 ppm over a 23 s span.
 
 ---
 
@@ -461,11 +486,11 @@ Wi-Fi transmit power is capped at 8.5 dBm in the YAML. That is a hardware fix fo
 
 ## 🧭 Possible future improvements
 
-### Measure what the loop seam costs
+### Measure what a chained batch costs
 
-Continuous TX mode restarts from the first entry when it meets the end marker, and the reference manual says only that the transmitter "starts transmitting the first data again" — it does not say whether the jump back adds any output time. Any plausible answer is small, and a decode cannot see it: the decoder rounds every run to one or two symbol periods, so a final run stretched by anything under half a symbol (104 µs, 39 channel ticks) reads identically to a perfect seam.
+The loop counter is ten bits, so a single batch tops out at 1023 frames — about 23 seconds. Past that the driver has to stop the channel and re-arm it, and that is a genuinely different seam from the loop wrap: the wrap is the peripheral reloading its own read pointer, which is measured above and costs nothing, whereas a chained batch is the CPU taking an interrupt and writing registers, so there is no reason to expect it to be free.
 
-The measurement that can see it is the one the symbol period came from — frame start to frame start, rising edge to rising edge at the same structural position — comparing a span that crosses a seam against one that does not. A rate error and a per-seam stretch both add a constant per frame, which is why the two spans are needed rather than one. It is a fact about the chip worth having for anything that later loops RMT output, and it changes nothing about whether this device works.
+The firmware currently refuses to go there — `rmt_beep::set_duration_ms()` rejects any duration needing more than one batch — which is the right default while the cost is unknown, since contiguity is the one property the collar actually requires. Measuring it would mean lifting that limit behind a flag and running the same slope method across the boundary. Nothing here needs a beep longer than 23 seconds, so this buys knowledge rather than function.
 
 ---
 

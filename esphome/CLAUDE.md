@@ -28,13 +28,13 @@ This is an ESPHome project for a **Wemos LOLIN C3 Mini** (ESP32-C3) that acts as
 
 - `d-control-400.yaml` — ESPHome config: board, Wi-Fi, LED, the template switch, and the boot button.
 - `cc1101.h` — Custom C++ namespace `cc1101_ctrl` wrapping RadioLib. Handles radio init and the start/finish halves of a transmission. It owns no timing and no RF settings — the register configuration comes from the shared `../include/cc1101_config.h`.
-- `../include/rmt_beep.h` — Shared transmission core: packs the payload into RMT words, creates the channel, starts a looped transmission and reports when it ends. Framework-agnostic (ESP-IDF driver only, no Arduino, no ESPHome, no logging), and used verbatim by the standalone path.
+- `../include/rmt_beep.h` — Shared transmission core: packs the payload into RMT words, creates the channel, starts a looped transmission and reports when it ends. Framework-agnostic (ESP-IDF driver only, no Arduino, no ESPHome, no logging), and used verbatim by the standalone path. It also timestamps each transmission at both ends; that data is read only by the standalone path's `m` sweep, and is recorded but unused here.
 - `../include/cc1101_config.h` — The six RadioLib calls that are the radio's whole RF personality: frequency, power, bit rate, RX bandwidth, OOK, standby. Shared verbatim with the standalone path, because a value changed in only one of them produces two firmwares that both build, both transmit, and differ only at range. Carrier and power are parameters defaulting to `signal.h`, which is what lets the standalone serial sweep pass its own.
 - `../include/led_policy.h` — The status LED palette as levels *emitted* by the WS2812, 0-255. Consumed directly by the standalone path; this YAML repeats the numbers as literals and cites the header (see below).
 - `../include/reset_reason.h` — `esp_reset_reason()` as a printable string, shared with the standalone path.
 - `../include/pinout.h` — SPI pin definitions for the CC1101 (SCK=1, MISO=0, MOSI=3, CS=10, GDO0=8). Plaintext, committed as-is.
 - `../include/signal.h` — The OOK payload as run lengths (`SIGNAL_BEEP_TICKS`), expressed in symbol periods rather than absolute microseconds. Positive = HIGH, negative = LOW; element `i` lasts `SYMBOL_TICKS` RMT channel ticks times `abs(ticks[i])`. **SOPS-encrypted.** Also defines `CARRIER_FREQUENCY`, `OUTPUT_POWER`, `BIT_RATE`, `RX_BANDWIDTH`, `SYMBOL_TICKS`, `RMT_RESOLUTION_HZ` and `BEEP_DURATION_MS`.
-- `secrets.yaml` — Wi-Fi credentials (not committed).
+- `secrets.yaml` — `wifi_ssid`, `wifi_password` and `api_encryption_key`. Gitignored; `esphome config` fails without all three.
 
 ### Critical implementation details
 
@@ -56,4 +56,4 @@ This is an ESPHome project for a **Wemos LOLIN C3 Mini** (ESP32-C3) that acts as
 
 **Hardware safety flag:** `cc1101_ctrl::is_ready()` guards all transmission paths. If the CC1101 is not detected on SPI at boot, the flag stays false and the switch silently no-ops, preventing SPI crashes.
 
-**Encrypted header:** `signal.h` is encrypted with SOPS + age (`.sops.yaml` matches only that path). A fresh clone will not compile until it is decrypted with `sops -d` or replaced with your own captured signal. Never commit it decrypted. If the plaintext was only read — which is the usual case, since decrypting is just to make the build work — restore it with `git checkout -- include/signal.h` rather than re-encrypting: `sops -e -i` rolls a fresh data key and MAC, so it produces a full-file diff for byte-identical content. Re-encrypt only when the payload was genuinely edited. `pinout.h` is not encrypted.
+**Encrypted header:** `signal.h` is encrypted with SOPS + age (`.sops.yaml` carries a rule for it and one for `signal_captures.txt`, to the same age recipient). A fresh clone will not compile until it is decrypted with `sops -d` or replaced with your own captured signal. Never commit it decrypted. If the plaintext was only read — which is the usual case, since decrypting is just to make the build work — restore it with `git checkout -- include/signal.h` rather than re-encrypting: `sops -e -i` rolls a fresh data key and MAC, so it produces a full-file diff for byte-identical content. Re-encrypt only when the payload was genuinely edited. `pinout.h` is not encrypted.
