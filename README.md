@@ -35,9 +35,13 @@ Demonstration of the project triggering the collar's sound beep function.
 ```
 .
 ├── src/main.cpp          # Standalone firmware — button, LED, TX sequence, serial console
-├── include/
+├── include/              # Shared by the two firmware paths
 │   ├── pinout.h          # Pin map for the custom SPI routing on the C3
-│   └── signal.h          # RF parameters + captured payload — ENCRYPTED, see below
+│   ├── signal.h          # RF parameters + captured payload — ENCRYPTED, see below
+│   ├── rmt_beep.h        # Transmission core — packs the frame, drives the RMT channel
+│   ├── cc1101_config.h   # The six RadioLib calls that set the radio's RF personality
+│   ├── led_policy.h      # Status LED palette, as levels emitted by the WS2812
+│   └── reset_reason.h    # esp_reset_reason() as a printable string
 ├── esphome/              # Home Assistant path: d-control-400.yaml + cc1101.h
 ├── tools/analyze_capture.py  # IQ → envelope → run lengths → base tick → frame → encoding tests
 ├── signal_captures.txt   # Decoded-frame worksheet — ENCRYPTED, not a build input
@@ -366,8 +370,8 @@ On macOS prefer `/dev/cu.*` over `/dev/tty.*` — the latter blocks on open wait
 The onboard RGB LED reports the device state:
 
 * 🟢 **Green, 0.5 s once at boot:** CC1101 initialised successfully.
-* 🟢 **Green pulse, 80 ms every 5 s:** liveness heartbeat — powered, running, radio OK.
-* 🟠 **Amber pulse, 80 ms every 5 s** *(ESPHome path only)*: alive and radio OK, but **Wi-Fi is down**.
+* 🟢 **Green pulse, 150 ms every 5 s:** liveness heartbeat — powered, running, radio OK.
+* 🟠 **Amber pulse, 150 ms every 5 s** *(ESPHome path only)*: alive and radio OK, but **Wi-Fi is down**.
 * 🔴 **Solid red, never pulsing:** radio initialisation failed — check the SPI wiring.
 * 🔵 **Solid blue:** transmitting. The heartbeat is suppressed for the duration.
 * ⚫ **Off:** no power, or the firmware has crashed.
@@ -445,7 +449,7 @@ esphome run d-control-400.yaml --device d-control-400.local    # OTA
 esphome logs d-control-400.yaml
 ```
 
-Both firmware paths share `include/pinout.h` and `include/signal.h`, so a change to RF behaviour usually has to land in both. The behavioural differences between them are deliberate and documented in `esphome/CLAUDE.md`.
+Both firmware paths share everything in `include/` — the pin map, the payload and RF parameters, the transmission core, the radio's register configuration, the LED palette and the reset-reason decode — so a change to RF behaviour lands once rather than in both. What the two paths still own separately is the trigger surface, the LED mechanism and how each waits for the hardware to finish; those differences are deliberate and documented in `esphome/CLAUDE.md`.
 
 Wi-Fi transmit power is capped at 8.5 dBm in the YAML. That is a hardware fix for LDO brownout on the C3 Mini's regulator, not a tuning preference — do not raise it.
 

@@ -19,7 +19,7 @@ Two runtimes, but since the RMT migration the radio logic itself is **not** dupl
 | Standalone PlatformIO | `src/main.cpp` | Arduino, button-only, no network |
 | ESPHome / Home Assistant | `esphome/d-control-400.yaml` + `esphome/cc1101.h` | ESPHome, exposes a template switch |
 
-Both include `include/pinout.h`, `include/signal.h`, `include/cc1101_config.h`, `include/reset_reason.h` and `include/rmt_beep.h`. See `esphome/CLAUDE.md` for ESPHome-specific detail.
+Both include `include/pinout.h`, `include/signal.h`, `include/cc1101_config.h`, `include/reset_reason.h` and `include/rmt_beep.h`. `include/led_policy.h` is included only by the standalone path, because ESPHome's YAML cannot include a C header — it is still the authority for both, and the LED section below explains why that authority is a citation rather than a compiler. See `esphome/CLAUDE.md` for ESPHome-specific detail.
 
 `include/rmt_beep.h` is the transmission core and is shared verbatim: it packs the payload into RMT words, creates the channel, starts a looped transmission and reports when it ends. It talks only to the ESP-IDF RMT driver and `signal.h` — no Arduino, no ESPHome, no logging, failures reported by return value — so each path can log in its own idiom. **A change to RF behaviour belongs there, once, not in both paths.**
 
@@ -90,7 +90,7 @@ Using the Linux path on macOS fails with `identity did not match any of the reci
 
 Verify with `age-keygen -y <path>` — that prints the *public* key, which must equal the recipient in `.sops.yaml`. Matching it proves decryption will work without touching the real file, and without putting the private key on screen.
 
-Re-encrypt with `sops -e -i include/signal.h` before committing. Never commit a decrypted `signal.h`. If the plaintext was only read and not edited, restore a pre-decrypt snapshot instead — `sops -e -i` rolls a fresh data key and MAC, so it diffs against HEAD even for identical content.
+Never commit a decrypted `signal.h`. If the plaintext was only read and not edited — the usual case, since decrypting is just to make the build compile — **restore it with `git checkout -- include/signal.h`**, which puts back HEAD's exact blob. `sops -e -i` rolls a fresh data key and MAC, so it produces a full-file diff for byte-identical content; that happened on 2026-09-13 and was caught only by reading `git diff --stat` before committing, a `lastmodified` timestamp minutes old being the tell. Re-encrypt with `sops -e -i` only when the payload was genuinely edited. A pre-decrypt snapshot works too, but it is the step that keeps getting skipped, and `git checkout` needs no foresight.
 
 Decrypt from the repo root and do not `cd` afterwards. A cleanup step holding a *relative* path stops protecting anything the moment the shell changes directory — that is how a decrypted `signal.h` was once left in the working tree.
 
